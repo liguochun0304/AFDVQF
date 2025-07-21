@@ -201,3 +201,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+data/HacRED
+data/MNRE
+data/MORE
+data/twitter2015
+data/twitter2017
+
+clip-patch32
+chinese-roberta-www-ext
