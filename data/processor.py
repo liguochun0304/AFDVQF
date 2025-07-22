@@ -175,8 +175,8 @@ class DataProcessor:
 
     def process_twitter2017(self, dataset, data_type):
         convert_bio_txt_to_jsonl(
-            input_txt_path="twitter2017/train.txt",
-            output_jsonl_path="twitter2017/train.jsonl",
+            input_txt_path=f"twitter2017/{data_type}.txt",
+            output_jsonl_path=f"twitter2017/{data_type}.jsonl",
             image_base_dir="twitter2017/twitter2017_images"
         )
 
@@ -190,3 +190,5 @@ class DataProcessor:
 if __name__ == '__main__':
     processor = DataProcessor()
     processor.process(dataset='twitter2017', data_type="train")
+    processor.process(dataset='twitter2017', data_type="test")
+    processor.process(dataset='twitter2017', data_type="valid")

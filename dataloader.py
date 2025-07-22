@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import RobertaTokenizer, CLIPProcessor
-
+import PIL
 label2id = {
     'O': 0, 'B-LOC': 1, 'I-LOC': 2,
     'B-ORG': 3, 'I-ORG': 4,
@@ -37,7 +37,6 @@ class MultimodalNERDataset(Dataset):
         entry = self.samples[idx]
         text = entry["text"]
         image_path = os.path.join("data", entry["image_path"])
-        print(image_path)
         labels = entry["labels"]
 
         encoded = self.tokenizer(text,
@@ -56,13 +55,16 @@ class MultimodalNERDataset(Dataset):
         label_ids = torch.tensor(label_ids, dtype=torch.long)
 
 
-        image = Image.open(image_path).convert("RGB")
-        image_tensor = self.processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
-        # if os.path.exists(image_path):
-        #     pass
-        # else:
-        #     print("未找到图片！")
-        #     image_tensor = torch.zeros(3, 224, 224)  # 默认空图像（黑图）
+        if os.path.exists(image_path):
+            try:
+                image = Image.open(image_path).convert("RGB")
+                image_tensor = self.processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
+            except PIL.UnidentifiedImageError:
+                print("图片缺失！")
+                image_tensor = torch.zeros(3, 224, 224)  # 默认空图像（黑图）
+        else:
+            print("未找到图片！")
+            image_tensor = torch.zeros(3, 224, 224)  # 默认空图像（黑图）
 
         return {
             "input_ids": input_ids,
