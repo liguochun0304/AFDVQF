@@ -20,10 +20,10 @@ label2id = {
 
 
 class MultimodalNERDataset(Dataset):
-    def __init__(self, jsonl_file, tokenizer, processor, max_length=128):
+    def __init__(self, dataset, tokenizer, processor, max_length=128):
         self.samples = []
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(self.script_dir, jsonl_file), 'r', encoding='utf-8') as f:
+        with open(os.path.join(self.script_dir, dataset), 'r', encoding='utf-8') as f:
             for line in f:
                 self.samples.append(json.loads(line.strip()))
         self.tokenizer = tokenizer
@@ -60,10 +60,8 @@ class MultimodalNERDataset(Dataset):
                 image = Image.open(image_path).convert("RGB")
                 image_tensor = self.processor(images=image, return_tensors="pt")["pixel_values"].squeeze(0)
             except PIL.UnidentifiedImageError:
-                print("图片缺失！")
                 image_tensor = torch.zeros(3, 224, 224)  # 默认空图像（黑图）
         else:
-            print("未找到图片！")
             image_tensor = torch.zeros(3, 224, 224)  # 默认空图像（黑图）
 
         return {
