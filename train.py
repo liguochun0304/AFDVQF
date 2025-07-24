@@ -62,7 +62,21 @@ def evaluate(model, val_loader, device):
 
 
 def train(config):
-    swanlab.init(project="multimodal-ner", run_name=config.run_name)
+    # swanlab.init(project="multimodal-ner", run_name=config.run_name)
+
+    # 初始化实验
+    swanlab.init(
+        project="MNER",
+        name=config.ex_name,
+        config={
+            "fin_tuning_lr": config.fin_tuning_lr,
+            "clip_lr": config.clip_lr,
+            "downs_en_lr": config.downs_en_lr,
+            "weight_decay": config.weight_decay_rate,
+            "batch_size": config.batch_size,
+            "epochs": config.epochs
+        }
+    )
 
     device = torch.device(config.device)
     tokenizer = RobertaTokenizer.from_pretrained(config.text_encoder)
@@ -76,20 +90,52 @@ def train(config):
 
     model = MultimodalNER().to(device)
 
-    # 分模块学习率
-    no_decay = ["bias", "LayerNorm.weight"]
-    grouped_params = [
+    no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
+
+    param_optimizer = list(model.named_parameters())
+    # 模块分类
+    param_roberta = [(n, p) for n, p in param_optimizer if "text_encoder" in n]
+    param_clip = [(n, p) for n, p in param_optimizer if "image_encoder" in n]
+    param_downstream = [(n, p) for n, p in param_optimizer if "text_encoder" not in n and "image_encoder" not in n]
+
+    # 构造 optimizer_grouped_parameters
+    optimizer_grouped_parameters = [
+        # Roberta
         {
-            "params": [p for n, p in model.named_parameters() if "text_encoder" in n],
+            "params": [p for n, p in param_roberta if not any(nd in n for nd in no_decay)],
+            "weight_decay": config.weight_decay_rate,
             "lr": config.fin_tuning_lr,
         },
         {
-            "params": [p for n, p in model.named_parameters() if "text_encoder" not in n],
+            "params": [p for n, p in param_roberta if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": config.fin_tuning_lr,
+        },
+        # CLIP
+        {
+            "params": [p for n, p in param_clip if not any(nd in n for nd in no_decay)],
+            "weight_decay": config.weight_decay_rate,
+            "lr": config.clip_lr,
+        },
+        {
+            "params": [p for n, p in param_clip if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": config.clip_lr,
+        },
+        # 下游模块
+        {
+            "params": [p for n, p in param_downstream if not any(nd in n for nd in no_decay)],
+            "weight_decay": config.weight_decay_rate,
             "lr": config.downs_en_lr,
-        }
+        },
+        {
+            "params": [p for n, p in param_downstream if any(nd in n for nd in no_decay)],
+            "weight_decay": 0.0,
+            "lr": config.downs_en_lr,
+        },
     ]
-    optimizer = torch.optim.AdamW(grouped_params, lr=config.downs_en_lr, weight_decay=config.weight_decay_rate)
-
+    # optimizer = torch.optim.AdamW(grouped_params, lr=config.downs_en_lr, weight_decay=config.weight_decay_rate)
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
     t_total = len(train_loader) // config.gradient_accumulation_steps * config.epochs
     warmup_steps = int(t_total * config.warmup_prop)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=t_total)
@@ -114,11 +160,31 @@ def train(config):
             loss = loss / config.gradient_accumulation_steps
             loss.backward()
 
+            # 每个 step 的 gradient norm 和 learning rate 记录（在 optimizer.step 之前）
             if (step + 1) % config.gradient_accumulation_steps == 0:
+                # ⬅️ 计算 grad_norm
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+
+                # ⬅️ clip 梯度，优化器步进
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+
+                # ⬅️ 记录 learning_rate（只记录第一组）
+                current_lr = scheduler.get_last_lr()[0]
+
+                # ⬅️ SwanLab 记录
+                swanlab.log({
+                    "train/grad_norm": total_norm,
+                    "train/learning_rate": current_lr,
+                    "step": epoch * len(train_loader) + step
+                })
 
             total_loss += loss.item()
             loop.set_postfix(loss=f"{loss.item():.4f}", lr=optimizer.param_groups[0]['lr'])
@@ -128,7 +194,8 @@ def train(config):
         print(f"\n✅ Epoch {epoch} Train Loss: {avg_loss:.4f}")
 
         f1, report = evaluate(model, val_loader, device)
-        print(f"🎯 Eval F1: {f1:.4f}")
+        print(
+            f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {report['weighted avg']['f1-score']:.4f} recall: {report['weighted avg']['recall']:.4f}")
 
         swanlab.log({
             "eval/f1": f1,
@@ -156,4 +223,3 @@ if __name__ == "__main__":
 
     config = get_config()
     train(config)
-
