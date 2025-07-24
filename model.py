@@ -14,70 +14,159 @@ from transformers import CLIPProcessor, CLIPModel, CLIPModel, CLIPProcessor, Ber
 from PIL import Image
 import os
 from transformers import RobertaTokenizer
+
+
+class CoAttention(nn.Module):
+    def __init__(self, hidden_dim, max_seq_len, num_img_region):
+        super(CoAttention, self).__init__()
+        self.max_seq_len = max_seq_len
+        self.num_img_region = num_img_region
+
+        # Text-guided visual attention
+        self.text_linear_1 = nn.Linear(hidden_dim, hidden_dim)
+        self.img_linear_1 = nn.Linear(hidden_dim, hidden_dim)
+        self.att_linear_1 = nn.Linear(hidden_dim * 2, 1)
+
+        # Visual-guided text attention
+        self.text_linear_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.img_linear_2 = nn.Linear(hidden_dim, hidden_dim)
+        self.att_linear_2 = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, text_features, img_features):
+        """
+        text_features: [B, T, H]
+        img_features:  [B, R, H]
+        """
+        B, T, H = text_features.size()
+        R = img_features.size(1)
+
+        ##### 1. Text-guided visual attention #####
+        text_exp = self.text_linear_1(text_features).unsqueeze(2)        # [B, T, 1, H]
+        img_exp = self.img_linear_1(img_features).unsqueeze(1)          # [B, 1, R, H]
+        fusion = torch.cat([text_exp.expand(-1, T, R, -1), img_exp.expand(-1, T, R, -1)], dim=-1)
+        fusion = torch.tanh(fusion)
+
+        visual_att = self.att_linear_1(fusion).squeeze(-1)              # [B, T, R]
+        visual_att = torch.softmax(visual_att, dim=-1)
+        att_img_features = torch.matmul(visual_att, img_features)      # [B, T, H]
+
+        ##### 2. Visual-guided text attention #####
+        # 改为广播方式，避免 repeat 占显存
+        img_exp = self.img_linear_2(att_img_features).unsqueeze(1)     # [B, 1, T, H]
+        text_exp = self.text_linear_2(text_features).unsqueeze(2)      # [B, T, 1, H]
+
+        fusion = torch.cat([img_exp.expand(-1, T, T, -1),
+                            text_exp.expand(-1, T, T, -1)], dim=-1)    # [B, T, T, 2H]
+        fusion = torch.tanh(fusion)
+
+        textual_att = self.att_linear_2(fusion).squeeze(-1)            # [B, T, T]
+        textual_att = torch.softmax(textual_att, dim=-1)
+        att_text_features = torch.matmul(textual_att, text_features)   # [B, T, H]
+
+        return att_text_features, att_img_features
+
+
+
+class GMF(nn.Module):
+    """Gated Multimodal Fusion (GMF)"""
+    def __init__(self, hidden_dim):
+        super(GMF, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.text_linear = nn.Linear(hidden_dim, hidden_dim)
+        self.img_linear = nn.Linear(hidden_dim, hidden_dim)
+        self.gate_linear = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, att_text_features, att_img_features):
+        """
+        att_text_features: [B, T, H]
+        att_img_features:  [B, T, H]
+        return: fused multimodal features [B, T, H]
+        """
+        new_img_feat = torch.tanh(self.img_linear(att_img_features))  # [B, T, H]
+        new_text_feat = torch.tanh(self.text_linear(att_text_features))  # [B, T, H]
+
+        gate_img = self.gate_linear(torch.cat([new_img_feat, new_text_feat], dim=-1))  # [B, T, 1]
+        gate_img = torch.sigmoid(gate_img)
+        gate_img = gate_img.expand(-1, -1, self.hidden_dim)  # [B, T, H]
+
+        multimodal_features = gate_img * new_img_feat + (1 - gate_img) * new_text_feat  # [B, T, H]
+        return multimodal_features
+
+
+
 class MultimodalNER(nn.Module):
     def __init__(self,
                  text_encoder_path="roberta-base",
                  image_encoder_path="clip-patch32",
                  num_labels=9,
-                 hidden_dim=256):
+                 hidden_dim=768,
+                 max_seq_len=128,
+                 num_img_region=1,
+                 dropout_rate=0.3,
+                 use_image=True):  # ✅ 添加控制图像模态的开关
         super(MultimodalNER, self).__init__()
 
-        # 文本编码器（RoBERTa）
+        self.use_image = use_image
+
+        self.text_hidden_size = hidden_dim
+
         self.roberta = RobertaModel.from_pretrained(text_encoder_path)
-        self.text_hidden_size = self.roberta.config.hidden_size  # 一般为768
-
-        # 图像编码器（CLIP）
         self.clip = CLIPModel.from_pretrained(image_encoder_path)
-        self.clip.eval()  # 推理模式，防止dropout等
+        self.clip.eval()
+        self.clip_proj = nn.Linear(self.clip.config.projection_dim, self.text_hidden_size)
 
-        # 获取 projection_dim（如512），注意不是 vision_model.config.hidden_size（如768）
-        self.image_hidden_size = self.clip.config.projection_dim  # ✅ 正确：为 get_image_features 的输出维度
-        self.clip_proj = nn.Linear(self.image_hidden_size, self.text_hidden_size)
+        self.dropout = nn.Dropout(p=dropout_rate)  # ✅ 添加统一 dropout
 
-        # BiLSTM
-        self.bilstm = nn.LSTM(input_size=self.text_hidden_size * 2,
-                              hidden_size=hidden_dim,
+        self.co_attention = CoAttention(hidden_dim=self.text_hidden_size,
+                                        max_seq_len=max_seq_len,
+                                        num_img_region=num_img_region)
+
+        self.gmf = GMF(hidden_dim=self.text_hidden_size)
+
+        self.bilstm = nn.LSTM(input_size=self.text_hidden_size,
+                              hidden_size=hidden_dim // 2,
                               num_layers=1,
                               bidirectional=True,
                               batch_first=True)
 
-        # 分类器 + CRF
-        self.classifier = nn.Linear(hidden_dim * 2, num_labels)
+        self.classifier = nn.Linear(hidden_dim, num_labels)
         self.crf = CRF(num_labels, batch_first=True)
 
-    def forward(self, input_ids, attention_mask, image_tensor, labels=None):
-        """
-        input_ids: [B, T]
-        attention_mask: [B, T]
-        image_tensor: [B, 3, 224, 224] - 使用 CLIPProcessor 预处理
-        labels: [B, T] (optional)
-        """
-        # 1. 文本特征提取
+    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
+        B, T = input_ids.size()
+
+        # 1. 文本特征
         roberta_output = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
-        text_feat = roberta_output.last_hidden_state  # [B, T, H]
+        text_feat = self.dropout(roberta_output.last_hidden_state)  # [B, T, H]
 
-        # 2. 图像特征提取
-        with torch.no_grad():
-            image_feat = self.clip.get_image_features(pixel_values=image_tensor)  # [B, 512]
-        image_feat = self.clip_proj(image_feat)  # [B, 768]
-        image_feat = image_feat.unsqueeze(1).repeat(1, text_feat.size(1), 1)  # [B, T, 768]
+        if self.use_image and image_tensor is not None:
+            # 2. 图像特征（CLIP）
+            with torch.no_grad():
+                image_feat = self.clip.get_image_features(pixel_values=image_tensor)  # [B, D_img]
+            image_feat = self.clip_proj(image_feat).unsqueeze(1)  # [B, 1, H]
+            image_feat = self.dropout(image_feat)
 
-        # 3. 拼接图文特征
-        fused_feat = torch.cat([text_feat, image_feat], dim=-1)  # [B, T, 2*768]
+            # 3. CoAttention 融合
+            att_text_feat, att_img_feat = self.co_attention(text_feat, image_feat)
+            fused_feat = self.gmf(att_text_feat, att_img_feat)
+        else:
+            # 如果不使用图像，就只用文本特征（self-attention 已由 RoBERTa 给出）
+            fused_feat = text_feat
 
-        # 4. BiLSTM -> Linear -> CRF
-        lstm_out, _ = self.bilstm(fused_feat)  # [B, T, 2*hidden_dim]
-        emissions = self.classifier(lstm_out)  # [B, T, num_labels]
+        fused_feat = self.dropout(fused_feat)
 
-        # 5. CRF训练或解码
+        # 4. BiLSTM + CRF
+        lstm_out, _ = self.bilstm(fused_feat)
+        lstm_out = self.dropout(lstm_out)
+        emissions = self.classifier(lstm_out)
+
         if labels is not None:
             mask = attention_mask.bool()
             loss = -self.crf(emissions, labels, mask=mask, reduction='mean')
             return loss
         else:
-            pred = self.crf.decode(emissions, mask=attention_mask.bool())  # List[List[int]]
+            pred = self.crf.decode(emissions, mask=attention_mask.bool())
             return pred
-
 
 # if __name__ == "__main__":
 #     import torch
