@@ -11,24 +11,21 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from transformers import RobertaTokenizer, CLIPProcessor
 import PIL
-label2id = {
-    'O': 0, 'B-LOC': 1, 'I-LOC': 2,
-    'B-ORG': 3, 'I-ORG': 4,
-    'B-PER': 5, 'I-PER': 6,
-    'B-MISC': 7, 'I-MISC': 8
-}
 
 
 class MultimodalNERDataset(Dataset):
-    def __init__(self, dataset, tokenizer, processor, max_length=128):
+    def __init__(self, dataset, tokenizer, processor, max_length=128, dataset_type="train"):
         self.samples = []
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(self.script_dir, dataset), 'r', encoding='utf-8') as f:
+        with open(os.path.join(self.script_dir,'data', dataset, f"{dataset_type}.jsonl"), 'r', encoding='utf-8') as f:
             for line in f:
                 self.samples.append(json.loads(line.strip()))
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_length = max_length
+
+        self.label2id = json.load(open(os.path.join(self.script_dir,'data', dataset, "label2id.json"), 'r', encoding='utf-8'))
+        self.id2label = {v: k for k, v in self.label2id.items()}
 
     def __len__(self):
         return len(self.samples)
@@ -49,11 +46,10 @@ class MultimodalNERDataset(Dataset):
         input_ids = encoded["input_ids"].squeeze(0)  # [T]
         attention_mask = encoded["attention_mask"].squeeze(0)  # [T]
 
-        label_ids = [label2id.get(l, 0) for l in labels]
+        label_ids = [self.label2id.get(l, self.label2id["O"]) for l in labels]
         label_ids = label_ids[:self.max_length]
         label_ids += [0] * (self.max_length - len(label_ids))  # pad to max_len
         label_ids = torch.tensor(label_ids, dtype=torch.long)
-
 
         if os.path.exists(image_path):
             try:
@@ -90,7 +86,7 @@ if __name__ == '__main__':
     tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     clip_processor = CLIPProcessor.from_pretrained("clip-patch32")
 
-    dataset = MultimodalNERDataset("data/twitter2017/train.jsonl", tokenizer, clip_processor)
+    dataset = MultimodalNERDataset("twitter2017", tokenizer, clip_processor,dataset_type="train")
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
 
     for batch in dataloader:

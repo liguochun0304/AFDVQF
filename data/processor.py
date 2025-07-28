@@ -108,6 +108,11 @@ def convert_bio_block_to_json(block, image_base_dir):
     else:
         text = "".join(tokens)
 
+
+    print(text)
+    print(tokens)
+    print(labels)
+    print("\n")
     # ✅ 额外检查：tokens 和 labels 长度是否一致
     assert len(tokens) == len(labels), f"Token 和 Label 数量不一致：{tokens}, {labels}"
 
@@ -131,6 +136,7 @@ def convert_bio_txt_to_jsonl(input_txt_path, output_jsonl_path, image_base_dir="
         # 如果不是第一个，加回 IMGID:
         if idx != 0:
             block = "IMGID:" + block
+
         sample = convert_bio_block_to_json(block, image_base_dir)
         if sample:
             results.append(sample)
@@ -296,4 +302,4 @@ class DataProcessor:
 if __name__ == '__main__':
     processor = DataProcessor()
     # processor.process(dataset='twitter2015')
-    processor.process(dataset='MNRE')
+    processor.process(dataset='twitter2017')
