@@ -10,14 +10,14 @@ import argparse
 def get_config():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--device", type=str, default="cuda:5")
+    parser.add_argument("--device", type=str, default="cuda:3")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--drop_prob", type=float, default=0.3)
 
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--fin_tuning_lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--fin_tuning_lr", type=float, default=1e-4)
     parser.add_argument("--clip_lr", type=float, default=1e-5)
     parser.add_argument("--downs_en_lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay_rate", type=float, default=0.01)
@@ -37,10 +37,10 @@ def get_config():
     parser.add_argument("--dataset_name", type=str, default="twitter2017")
     parser.add_argument("--run_name", type=str, default="roberta-clip")
 
-    parser.add_argument("--ex_name", type=str, default="test_not_image")
-    parser.add_argument("--use_image", type=bool, default=False)
-    parser.add_argument("--num_labels", type=int, default=9)
-    parser.add_argument("--hidden_dim", type=int, default=9)
+    parser.add_argument("--ex_name", type=str, default="deep_attention n=4")
+    parser.add_argument("--use_image", type=bool, default=True)
+    # parser.add_argument("--num_labels", type=int, default=9)
+    # parser.add_argument("--hidden_dim", type=int, default=9)
 
 
 

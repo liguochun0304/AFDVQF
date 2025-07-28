@@ -82,8 +82,10 @@ def train(config):
     tokenizer = RobertaTokenizer.from_pretrained(config.text_encoder)
     processor = CLIPProcessor.from_pretrained(config.image_encoder)
 
-    train_dataset = MultimodalNERDataset(config.train_file, tokenizer, processor, max_length=config.max_len)
-    val_dataset = MultimodalNERDataset(config.val_file, tokenizer, processor, max_length=config.max_len)
+    train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
+                                         dataset_type="train")
+    val_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
+                                       dataset_type="valid")
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
@@ -210,12 +212,12 @@ def train(config):
             patience_counter = 0
             save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_f1)
             print(f"✅ Model saved to {save_dir}")
-        else:
-            patience_counter += 1
-            print(f"📉 No improvement, patience {patience_counter}/{config.patience_num}")
-            if epoch >= config.min_epoch_num and patience_counter >= config.patience_num:
-                print("⛔️ Early stopping triggered.")
-                break
+        # else:
+        #     patience_counter += 1
+        #     print(f"📉 No improvement, patience {patience_counter}/{config.patience_num}")
+        #     if epoch >= config.min_epoch_num and patience_counter >= config.patience_num:
+        #         print("⛔️ Early stopping triggered.")
+        #         break
 
 
 if __name__ == "__main__":

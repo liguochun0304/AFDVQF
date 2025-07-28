@@ -8,19 +8,26 @@
 import torch
 import torch.nn as nn
 from torchcrf import CRF
+from transformers import CLIPModel
 from transformers import RobertaModel
-from transformers import RobertaTokenizer, RobertaModel
-from transformers import CLIPProcessor, CLIPModel, CLIPModel, CLIPProcessor, BertTokenizer, CLIPModel
-from PIL import Image
-import os
-from transformers import RobertaTokenizer
 
 
+class FeedForward(nn.Module):
+    def __init__(self, hidden_dim, ffn_dim, dropout=0.1):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x):
+        return self.ffn(x)
 class CoAttention(nn.Module):
-    def __init__(self, hidden_dim, max_seq_len, num_img_region):
+    def __init__(self, hidden_dim):
         super(CoAttention, self).__init__()
-        self.max_seq_len = max_seq_len
-        self.num_img_region = num_img_region
 
         # Text-guided visual attention
         self.text_linear_1 = nn.Linear(hidden_dim, hidden_dim)
@@ -65,7 +72,44 @@ class CoAttention(nn.Module):
 
         return att_text_features, att_img_features
 
+class CoAttentionBlock(nn.Module):
+    def __init__(self, hidden_dim, ffn_dim=2048, dropout=0.1):
+        super().__init__()
+        self.co_att = CoAttention(hidden_dim)
 
+        self.norm_text1 = nn.LayerNorm(hidden_dim)
+        self.norm_img1 = nn.LayerNorm(hidden_dim)
+        self.ffn_text = FeedForward(hidden_dim, ffn_dim, dropout)
+        self.ffn_img = FeedForward(hidden_dim, ffn_dim, dropout)
+        self.norm_text2 = nn.LayerNorm(hidden_dim)
+        self.norm_img2 = nn.LayerNorm(hidden_dim)
+
+    def forward(self, text_feats, img_feats):
+        # Co-Attention
+        att_text, att_img = self.co_att(text_feats, img_feats)
+
+        # Residual + Norm
+        text_feats = self.norm_text1(text_feats + att_text)
+        img_feats = self.norm_img1(img_feats + att_img)
+
+        # FFN + Residual + Norm
+        text_feats = self.norm_text2(text_feats + self.ffn_text(text_feats))
+        img_feats = self.norm_img2(img_feats + self.ffn_img(img_feats))
+
+        return text_feats, img_feats
+
+
+class DeepCoAttention(nn.Module):
+    def __init__(self, hidden_dim, num_layers=4, ffn_dim=2048, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            CoAttentionBlock(hidden_dim, ffn_dim, dropout) for _ in range(num_layers)
+        ])
+
+    def forward(self, text_feats, img_feats):
+        for layer in self.layers:
+            text_feats, img_feats = layer(text_feats, img_feats)
+        return text_feats, img_feats
 
 class GMF(nn.Module):
     """Gated Multimodal Fusion (GMF)"""
@@ -117,10 +161,11 @@ class MultimodalNER(nn.Module):
 
         self.dropout = nn.Dropout(p=dropout_rate)  # ✅ 添加统一 dropout
 
-        self.co_attention = CoAttention(hidden_dim=self.text_hidden_size,
-                                        max_seq_len=max_seq_len,
-                                        num_img_region=num_img_region)
+        # self.co_attention = CoAttention(hidden_dim=self.text_hidden_size,
+        #                                 max_seq_len=max_seq_len,
+        #                                 num_img_region=num_img_region)
 
+        self.deep_co_attention = DeepCoAttention(hidden_dim=self.text_hidden_size, num_layers=4, ffn_dim=2048, dropout=0.3)
         self.gmf = GMF(hidden_dim=self.text_hidden_size)
 
         self.bilstm = nn.LSTM(input_size=self.text_hidden_size,
@@ -133,7 +178,6 @@ class MultimodalNER(nn.Module):
         self.crf = CRF(num_labels, batch_first=True)
 
     def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        B, T = input_ids.size()
 
         # 1. 文本特征
         roberta_output = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
@@ -147,7 +191,7 @@ class MultimodalNER(nn.Module):
             image_feat = self.dropout(image_feat)
 
             # 3. CoAttention 融合
-            att_text_feat, att_img_feat = self.co_attention(text_feat, image_feat)
+            att_text_feat, att_img_feat = self.deep_co_attention(text_feat, image_feat)
             fused_feat = self.gmf(att_text_feat, att_img_feat)
         else:
             # 如果不使用图像，就只用文本特征（self-attention 已由 RoBERTa 给出）
