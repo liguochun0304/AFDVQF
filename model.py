@@ -25,6 +25,8 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.ffn(x)
+
+
 class CoAttention(nn.Module):
     def __init__(self, hidden_dim):
         super(CoAttention, self).__init__()
@@ -58,7 +60,6 @@ class CoAttention(nn.Module):
         att_img_features = torch.matmul(visual_att, img_features)      # [B, T, H]
 
         ##### 2. Visual-guided text attention #####
-        # 改为广播方式，避免 repeat 占显存
         img_exp = self.img_linear_2(att_img_features).unsqueeze(1)     # [B, 1, T, H]
         text_exp = self.text_linear_2(text_features).unsqueeze(2)      # [B, T, 1, H]
 
@@ -71,6 +72,7 @@ class CoAttention(nn.Module):
         att_text_features = torch.matmul(textual_att, text_features)   # [B, T, H]
 
         return att_text_features, att_img_features
+
 
 class CoAttentionBlock(nn.Module):
     def __init__(self, hidden_dim, ffn_dim=2048, dropout=0.1):
@@ -99,17 +101,7 @@ class CoAttentionBlock(nn.Module):
         return text_feats, img_feats
 
 
-class DeepCoAttention(nn.Module):
-    def __init__(self, hidden_dim, num_layers=4, ffn_dim=2048, dropout=0.1):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            CoAttentionBlock(hidden_dim, ffn_dim, dropout) for _ in range(num_layers)
-        ])
 
-    def forward(self, text_feats, img_feats):
-        for layer in self.layers:
-            text_feats, img_feats = layer(text_feats, img_feats)
-        return text_feats, img_feats
 
 class GMF(nn.Module):
     """Gated Multimodal Fusion (GMF)"""
@@ -161,11 +153,7 @@ class MultimodalNER(nn.Module):
 
         self.dropout = nn.Dropout(p=dropout_rate)  # ✅ 添加统一 dropout
 
-        # self.co_attention = CoAttention(hidden_dim=self.text_hidden_size,
-        #                                 max_seq_len=max_seq_len,
-        #                                 num_img_region=num_img_region)
-
-        self.deep_co_attention = DeepCoAttention(hidden_dim=self.text_hidden_size, num_layers=4, ffn_dim=2048, dropout=0.3)
+        self.co_attention = CoAttentionBlock(hidden_dim=self.text_hidden_size)
         self.gmf = GMF(hidden_dim=self.text_hidden_size)
 
         self.bilstm = nn.LSTM(input_size=self.text_hidden_size,
@@ -191,7 +179,7 @@ class MultimodalNER(nn.Module):
             image_feat = self.dropout(image_feat)
 
             # 3. CoAttention 融合
-            att_text_feat, att_img_feat = self.deep_co_attention(text_feat, image_feat)
+            att_text_feat, att_img_feat = self.co_attention(text_feat, image_feat)
             fused_feat = self.gmf(att_text_feat, att_img_feat)
         else:
             # 如果不使用图像，就只用文本特征（self-attention 已由 RoBERTa 给出）

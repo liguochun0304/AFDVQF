@@ -62,11 +62,10 @@ def evaluate(model, val_loader, device):
 
 
 def train(config):
-    # swanlab.init(project="multimodal-ner", run_name=config.run_name)
     print("train config:", config)
-    # 初始化实验
+    # 初始化实验ex_project
     swanlab.init(
-        project="MNER",
+        project=config.ex_project,
         name=config.ex_name,
         config={
             "fin_tuning_lr": config.fin_tuning_lr,
@@ -145,8 +144,7 @@ def train(config):
     best_f1 = 0.0
     patience_counter = 0
 
-    save_dir = f"save_models/{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_lr{config.lr}_bs{config.batch_size}"
-
+    save_dir = f"save_models/{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_ex{str(config.ex_nums)}"
     for epoch in range(1, config.epochs + 1):
         model.train()
         total_loss = 0.0
@@ -164,7 +162,7 @@ def train(config):
 
             # 每个 step 的 gradient norm 和 learning rate 记录（在 optimizer.step 之前）
             if (step + 1) % config.gradient_accumulation_steps == 0:
-                # ⬅️ 计算 grad_norm
+                # 计算 grad_norm
                 total_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
@@ -172,16 +170,16 @@ def train(config):
                         total_norm += param_norm.item() ** 2
                 total_norm = total_norm ** 0.5
 
-                # ⬅️ clip 梯度，优化器步进
+                #  clip 梯度，优化器步进
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # ⬅️ 记录 learning_rate（只记录第一组）
+                #  记录 learning_rate（只记录第一组）
                 current_lr = scheduler.get_last_lr()[0]
 
-                # ⬅️ SwanLab 记录
+                #  SwanLab 记录
                 swanlab.log({
                     "train/grad_norm": total_norm,
                     "train/learning_rate": current_lr,
@@ -192,7 +190,7 @@ def train(config):
             loop.set_postfix(loss=f"{loss.item():.4f}", lr=optimizer.param_groups[0]['lr'])
 
         avg_loss = total_loss / len(train_loader)
-        swanlab.log({"train/loss": avg_loss, "epoch": epoch})
+        swanlab.log({"train/loss": avg_loss})
         print(f"\n✅ Epoch {epoch} Train Loss: {avg_loss:.4f}")
 
         f1, report = evaluate(model, val_loader, device)

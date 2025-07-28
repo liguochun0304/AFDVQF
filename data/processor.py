@@ -108,6 +108,11 @@ def convert_bio_block_to_json(block, image_base_dir):
     else:
         text = "".join(tokens)
 
+
+    print(text)
+    print(tokens)
+    print(labels)
+    print("\n")
     # ✅ 额外检查：tokens 和 labels 长度是否一致
     assert len(tokens) == len(labels), f"Token 和 Label 数量不一致：{tokens}, {labels}"
 
@@ -118,62 +123,63 @@ def convert_bio_block_to_json(block, image_base_dir):
     }
 
 
-def convert_bio_txt_to_jsonl(input_txt_path, output_jsonl_path, image_base_dir="data/images",
-                             label_json_path="label2id.json"):
+def convert_bio_txt_to_jsonl(input_txt_path, output_jsonl_path, image_base_dir="data/images"):
     with open(os.path.join(script_dir, input_txt_path), "r", encoding="utf-8") as f:
         content = f.read()
 
     # 按 IMGID 段落划分
     blocks = content.strip().split("\nIMGID:")
     results = []
-    all_labels = set()
-
     for idx, block in enumerate(blocks):
         if not block.strip():
             continue
+        # 如果不是第一个，加回 IMGID:
         if idx != 0:
             block = "IMGID:" + block
+
         sample = convert_bio_block_to_json(block, image_base_dir)
         if sample:
             results.append(sample)
-            all_labels.update(sample["labels"])
 
     # 写入 JSONL 文件
     with open(os.path.join(script_dir, output_jsonl_path), "w", encoding="utf-8") as out_f:
         for item in results:
             out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
-    # 提取并保存标签映射
-    label_list = sorted(all_labels, key=lambda x: (x == "O", x))  # "O" 放最前
-    label2id = {label: idx for idx, label in enumerate(label_list)}
-
-    with open(os.path.join(script_dir, label_json_path), "w", encoding="utf-8") as label_f:
-        json.dump(label2id, label_f, ensure_ascii=False, indent=2)
-
     print(f"✅ 转换完成，共处理 {len(results)} 条样本，输出至：{output_jsonl_path}")
-    print(f"✅ 标签已保存至：{label_json_path}，共 {len(label2id)} 类标签")
 
 
 import json
 from collections import defaultdict
 
 
-def convert_and_merge_by_img(input_file, output_file, image_prefix="twitter2017/twitter2017_images/",
-                             label_json_path="label2id.json"):
+def convert_and_merge_by_img(input_file, output_file, image_prefix="twitter2017/twitter2017_images/"):
     grouped = defaultdict(list)
-
     # Step 1: 读入并按 img_id 分组
     with open(os.path.join(script_dir, input_file), "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
+            # 替换非法 json 引号（如果是单引号）
+            # line = line.replace("'", '"')
+            # data = json.loads(line)
+
             data = json5.loads(line)
+
+            # 如果 relation 是字符串 "None"，你可能想把它当成 null
+            # if data.get("relation") == "None":
+            #     data["relation"] = None
+
+            # try:
+            #     pass
+            # except Exception as e:
+            #     print(f"跳过解析错误行: {e}")
+            #     continue
             grouped[data["img_id"]].append(data)
 
     # Step 2: 每个 img_id 合并处理
     merged_results = []
-    all_labels = set()
 
     for img_id, items in grouped.items():
         merged_tokens = []
@@ -184,37 +190,25 @@ def convert_and_merge_by_img(input_file, output_file, image_prefix="twitter2017/
             h_pos = data["h"]["pos"]
             relation = data["relation"]
 
+            # if relation == None: continue
+
             # 初始化全O标签
+            head_label = relation.strip("/").split("/")[0].upper()
+
             labels = ["O"] * len(tokens)
-            if relation and 0 <= h_pos[0] < h_pos[1] <= len(tokens):
-                head_label = relation.strip("/").split("/")[0].upper()
+            if 0 <= h_pos[0] < h_pos[1] <= len(tokens):
                 labels[h_pos[0]] = f"B-{head_label}"
                 for i in range(h_pos[0] + 1, h_pos[1]):
                     labels[i] = f"I-{head_label}"
 
             merged_tokens.extend(tokens)
             merged_labels.extend(labels)
-            all_labels.update(labels)
 
         merged_results.append({
             "text": " ".join(merged_tokens),
             "image_path": f"{image_prefix}{img_id}",
             "labels": merged_labels
         })
-
-    # Step 3: 写入合并结果
-    with open(os.path.join(script_dir, output_file), "w", encoding="utf-8") as out_f:
-        for item in merged_results:
-            out_f.write(json.dumps(item, ensure_ascii=False) + "\n")
-
-    # Step 4: 保存 label2id 映射
-    label_list = sorted(all_labels, key=lambda x: (x == "O", x))
-    label2id = {label: idx for idx, label in enumerate(label_list)}
-    with open(os.path.join(script_dir, label_json_path), "w", encoding="utf-8") as label_f:
-        json.dump(label2id, label_f, ensure_ascii=False, indent=2)
-
-    print(f"✅ 合并完成，共处理 {len(merged_results)} 条样本，输出至：{output_file}")
-    print(f"✅ 标签映射已保存至：{label_json_path}，共 {len(label2id)} 类标签")
 
     # Step 3: 写出为 JSONL
     with open(os.path.join(script_dir, output_file), "w", encoding="utf-8") as fout:
@@ -267,41 +261,35 @@ class DataProcessor:
         convert_bio_txt_to_jsonl(
             input_txt_path=f"{dataset}/train.txt",
             output_jsonl_path=f"{dataset}/train.jsonl",
-            image_base_dir=f"{dataset}/{dataset}_images",
-            label_json_path=f"{dataset}/label2id.json"
+            image_base_dir=f"{dataset}/{dataset}_images"
         )
         convert_bio_txt_to_jsonl(
             input_txt_path=f"{dataset}/test.txt",
             output_jsonl_path=f"{dataset}/test.jsonl",
-            image_base_dir=f"{dataset}/{dataset}_images",
-            label_json_path=f"{dataset}/label2id.json"
+            image_base_dir=f"{dataset}/{dataset}_images"
         )
 
         convert_bio_txt_to_jsonl(
             input_txt_path=f"{dataset}/valid.txt",
             output_jsonl_path=f"{dataset}/valid.jsonl",
-            image_base_dir=f"{dataset}/{dataset}_images",
-            label_json_path=f"{dataset}/label2id.json"
+            image_base_dir=f"{dataset}/{dataset}_images"
         )
 
     def process_MORE(self, dataset="MNRE"):
         convert_and_merge_by_img(
             input_file="MNRE/mnre_txt/mnre_train.txt",
             output_file=f"MNRE/train.jsonl",
-            image_prefix="MNRE/mnre_image/train",
-            label_json_path="MNRE/label2id.json"
+            image_prefix="MNRE/mnre_image/train"
         )
         convert_and_merge_by_img(
             input_file="MNRE/mnre_txt/mnre_val.txt",
             output_file=f"MNRE/valid.jsonl",
-            image_prefix="MNRE/mnre_image/val",
-            label_json_path="MNRE/label2id.json"
+            image_prefix="MNRE/mnre_image/val"
         )
         convert_and_merge_by_img(
             input_file="MNRE/mnre_txt/mnre_test.txt",
             output_file=f"MNRE/test.jsonl",
-            image_prefix="MNRE/mnre_image/test",
-            label_json_path="MNRE/label2id.json"
+            image_prefix="MNRE/mnre_image/test"
         )
 
     def process(self, dataset):
@@ -309,12 +297,9 @@ class DataProcessor:
             return self.process_twitter(dataset)
         if dataset == 'MNRE':
             return self.process_MORE(dataset)
-        if dataset == 'NewsMKG':
-            pass
 
 
 if __name__ == '__main__':
     processor = DataProcessor()
-    # processor.process(dataset='twitter2017')
-    # processor.process(dataset='MNRE')
-    processor.process(dataset='NewsMKG')
+    # processor.process(dataset='twitter2015')
+    processor.process(dataset='twitter2017')
