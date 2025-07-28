@@ -40,9 +40,13 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
     return state["epoch"], state["best_f1"]
 
 
-def evaluate(model, val_loader, device):
+from seqeval.metrics import classification_report as seq_classification_report
+from seqeval.metrics import f1_score as seq_f1_score
+
+
+def evaluate(model, val_loader, device, id2label):
     model.eval()
-    all_preds, all_labels = [], []
+    all_preds, all_labels = [],[]
 
     with torch.no_grad():
         for batch in val_loader:
@@ -51,14 +55,22 @@ def evaluate(model, val_loader, device):
             labels = batch["labels"].to(device)
             image_tensor = batch["image_tensor"].to(device)
 
-            pred = model(input_ids, attention_mask, image_tensor)
-            for p, l, m in zip(pred, labels, attention_mask):
-                valid_len = m.sum().item()
-                all_preds.extend(p[:valid_len])
-                all_labels.extend(l[:valid_len].cpu().tolist())
+            # 预测的标签 id 序列
+            preds = model(input_ids, attention_mask, image_tensor)
 
-    report = classification_report(all_labels, all_preds, output_dict=True, zero_division=0)
-    return report["weighted avg"]["f1-score"], report
+            for p_ids, l_ids, mask in zip(preds, labels, attention_mask):
+                valid_len = mask.sum().item()
+                # 截取有效 token，映射成标签字符串
+                pred_labels = [id2label[i] for i in p_ids[:valid_len]]
+                true_labels = [id2label[i.item()] for i in l_ids[:valid_len]]
+
+                all_preds.append(pred_labels)
+                all_labels.append(true_labels)
+
+    # 实体级别评估
+    f1 = seq_f1_score(all_labels, all_preds)
+    report = seq_classification_report(all_labels, all_preds, zero_division=0, digits=4,output_dict=True)
+    return f1, report
 
 
 def train(config):
@@ -195,7 +207,7 @@ def train(config):
 
         f1, report = evaluate(model, val_loader, device)
         print(
-            f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {report['weighted avg']['f1-score']:.4f} recall: {report['weighted avg']['recall']:.4f}")
+            f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {report['weighted avg']['precision']:.4f} recall: {report['weighted avg']['recall']:.4f}")
 
         swanlab.log({
             "eval/f1": f1,
@@ -210,12 +222,12 @@ def train(config):
             patience_counter = 0
             save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_f1)
             print(f"✅ Model saved to {save_dir}")
-        # else:
-        #     patience_counter += 1
-        #     print(f"📉 No improvement, patience {patience_counter}/{config.patience_num}")
-        #     if epoch >= config.min_epoch_num and patience_counter >= config.patience_num:
-        #         print("⛔️ Early stopping triggered.")
-        #         break
+        else:
+            patience_counter += 1
+            print(f"📉 No improvement, patience {patience_counter}/{config.patience_num}")
+            if epoch >= config.min_epoch_num and patience_counter >= config.patience_num:
+                print("⛔️ Early stopping triggered.")
+                break
 
 
 if __name__ == "__main__":

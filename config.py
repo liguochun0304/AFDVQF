@@ -13,7 +13,7 @@ def get_config():
 
     parser.add_argument("--device", type=str, default="cuda:3")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--drop_prob", type=float, default=0.3)
 
@@ -31,7 +31,7 @@ def get_config():
 
     parser.add_argument("--text_encoder", type=str, default="roberta-base")
     parser.add_argument("--image_encoder", type=str, default="clip-patch32")
-    parser.add_argument("--dataset_name", type=str, default="twitter2017")
+    parser.add_argument("--dataset_name", type=str, default="twitter2015")
 
     parser.add_argument("--ex_project", type=str, default="MNER")
     parser.add_argument("--ex_name", type=str, default="clip model last output")

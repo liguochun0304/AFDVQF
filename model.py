@@ -180,6 +180,8 @@ class MultimodalNER(nn.Module):
 
             # 3. CoAttention 融合
             att_text_feat, att_img_feat = self.co_attention(text_feat, image_feat)
+
+            # 图像特征与文本特征融合
             fused_feat = self.gmf(att_text_feat, att_img_feat)
         else:
             # 如果不使用图像，就只用文本特征（self-attention 已由 RoBERTa 给出）
