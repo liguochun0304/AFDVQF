@@ -37,6 +37,20 @@ def get_config():
     parser.add_argument("--dataset_name", type=str, default="twitter2017")
     parser.add_argument("--run_name", type=str, default="roberta-clip")
 
-    parser.add_argument("--ex_name", type=str, default="test")
+    parser.add_argument("--ex_name", type=str, default="test_not_image")
     parser.add_argument("--use_image", type=bool, default=False)
+    parser.add_argument("--num_labels", type=int, default=9)
+    parser.add_argument("--hidden_dim", type=int, default=9)
+
+
+
+
+
+    """
+                 hidden_dim=768,
+                 max_seq_len=128,
+                 num_img_region=1,
+                 dropout_rate=0.3,
+                 use_image=True):  # ✅ 添加控制图像模态的开关
+    """
     return parser.parse_args()

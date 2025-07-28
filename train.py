@@ -63,7 +63,7 @@ def evaluate(model, val_loader, device):
 
 def train(config):
     # swanlab.init(project="multimodal-ner", run_name=config.run_name)
-
+    print("train config:", config)
     # 初始化实验
     swanlab.init(
         project="MNER",
@@ -88,7 +88,7 @@ def train(config):
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    model = MultimodalNER().to(device)
+    model = MultimodalNER(use_image=config.use_image).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
