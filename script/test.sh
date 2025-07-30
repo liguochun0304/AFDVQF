@@ -1,2 +1,1 @@
-
-python ../test.py --model_dir save_models/2025-07-28_train-twitter2017_lr0.001_bs64 --device cuda:0
+python ../test.py --save_name "2025-07-30_train-twitter2017_ex0" --device cuda:0

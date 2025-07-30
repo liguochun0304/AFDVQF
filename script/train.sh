@@ -1,8 +1,19 @@
-python train.py \
-  --device cuda:4 \
-  --epochs 50 \
-  --batch_size 32 \
-  --lr 5e-4 \
-  --use_image False \
-  --run_name test_run \
-  --ex_name "no image ablation"
+python ../train.py \
+  --device "cuda:0" \
+  --epochs 100 \
+  --batch_size 128 \
+  --drop_prob 0.3 \
+  --downs_en_lr 3e-4 \
+  --weight_decay_rate 0.01 \
+  --clip_grad 2.0 \
+  --warmup_prop 0.1 \
+  --gradient_accumulation_steps 2 \
+  --min_epoch_num 5 \
+  --patience 0.00001 \
+  --patience_num 20 \
+  --text_encoder "roberta-base" \
+  --image_encoder "clip-patch32" \
+  --dataset_name "twitter2017" \
+  --ex_project "MNER_Ablation_study" \
+  --ex_name "our" \
+  --ex_nums 0
