@@ -4,15 +4,22 @@
 # @FileName: train.py
 # @Software: PyCharm
 # @Email   ：liguochun0304@163.com
-import os, json, torch, argparse
+import json
+import os
 from datetime import datetime
-from torch.utils.data import DataLoader
-from transformers import RobertaTokenizer, CLIPProcessor, get_linear_schedule_with_warmup
-from model import MultimodalNER
-from dataloader import MultimodalNERDataset, collate_fn
-from sklearn.metrics import classification_report
-from tqdm import tqdm
+
 import swanlab
+import torch
+from seqeval.metrics import classification_report as seq_classification_report
+from seqeval.metrics import f1_score as seq_f1_score
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import RobertaTokenizer, CLIPProcessor, get_linear_schedule_with_warmup
+
+from dataloader import MultimodalNERDataset, collate_fn
+from model import MultimodalNER
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_metric):
@@ -40,13 +47,9 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
     return state["epoch"], state["best_f1"]
 
 
-from seqeval.metrics import classification_report as seq_classification_report
-from seqeval.metrics import f1_score as seq_f1_score
-
-
 def evaluate(model, val_loader, device, id2label):
     model.eval()
-    all_preds, all_labels = [],[]
+    all_preds, all_labels = [], []
 
     with torch.no_grad():
         for batch in val_loader:
@@ -69,16 +72,18 @@ def evaluate(model, val_loader, device, id2label):
 
     # 实体级别评估
     f1 = seq_f1_score(all_labels, all_preds)
-    report = seq_classification_report(all_labels, all_preds, zero_division=0, digits=4,output_dict=True)
+    report = seq_classification_report(all_labels, all_preds, zero_division=0, digits=4, output_dict=True)
     return f1, report
 
 
 def train(config):
     print("train config:", config)
+    swanlab_name = f"{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_ex{str(config.ex_nums)}"
+    print("train pth save name and swanlab name is", swanlab_name)
     # 初始化实验ex_project
     swanlab.init(
         project=config.ex_project,
-        name=config.ex_name,
+        name=f"{swanlab_name}",
         config={
             "fin_tuning_lr": config.fin_tuning_lr,
             "clip_lr": config.clip_lr,
@@ -86,12 +91,15 @@ def train(config):
             "weight_decay": config.weight_decay_rate,
             "batch_size": config.batch_size,
             "epochs": config.epochs
-        }
+        },
+        dir=os.path.join(script_dir, "swanlog")
     )
 
+    save_dir = os.path.join(script_dir, "save_models", swanlab_name)
+
     device = torch.device(config.device)
-    tokenizer = RobertaTokenizer.from_pretrained(config.text_encoder)
-    processor = CLIPProcessor.from_pretrained(config.image_encoder)
+    tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
+    processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
     train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
                                          dataset_type="train")
@@ -156,7 +164,6 @@ def train(config):
     best_f1 = 0.0
     patience_counter = 0
 
-    save_dir = f"save_models/{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_ex{str(config.ex_nums)}"
     for epoch in range(1, config.epochs + 1):
         model.train()
         total_loss = 0.0
@@ -205,7 +212,7 @@ def train(config):
         swanlab.log({"train/loss": avg_loss})
         print(f"\n✅ Epoch {epoch} Train Loss: {avg_loss:.4f}")
 
-        f1, report = evaluate(model, val_loader, device)
+        f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
         print(
             f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {report['weighted avg']['precision']:.4f} recall: {report['weighted avg']['recall']:.4f}")
 
