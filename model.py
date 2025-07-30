@@ -4,7 +4,7 @@
 # @FileName: model.py
 # @Software: PyCharm
 # @E-mail  : liguochun0304@163.com
-
+import os
 import torch
 import torch.nn as nn
 from torchcrf import CRF
@@ -50,26 +50,26 @@ class CoAttention(nn.Module):
         R = img_features.size(1)
 
         ##### 1. Text-guided visual attention #####
-        text_exp = self.text_linear_1(text_features).unsqueeze(2)        # [B, T, 1, H]
-        img_exp = self.img_linear_1(img_features).unsqueeze(1)          # [B, 1, R, H]
+        text_exp = self.text_linear_1(text_features).unsqueeze(2)  # [B, T, 1, H]
+        img_exp = self.img_linear_1(img_features).unsqueeze(1)  # [B, 1, R, H]
         fusion = torch.cat([text_exp.expand(-1, T, R, -1), img_exp.expand(-1, T, R, -1)], dim=-1)
         fusion = torch.tanh(fusion)
 
-        visual_att = self.att_linear_1(fusion).squeeze(-1)              # [B, T, R]
+        visual_att = self.att_linear_1(fusion).squeeze(-1)  # [B, T, R]
         visual_att = torch.softmax(visual_att, dim=-1)
-        att_img_features = torch.matmul(visual_att, img_features)      # [B, T, H]
+        att_img_features = torch.matmul(visual_att, img_features)  # [B, T, H]
 
         ##### 2. Visual-guided text attention #####
-        img_exp = self.img_linear_2(att_img_features).unsqueeze(1)     # [B, 1, T, H]
-        text_exp = self.text_linear_2(text_features).unsqueeze(2)      # [B, T, 1, H]
+        img_exp = self.img_linear_2(att_img_features).unsqueeze(1)  # [B, 1, T, H]
+        text_exp = self.text_linear_2(text_features).unsqueeze(2)  # [B, T, 1, H]
 
         fusion = torch.cat([img_exp.expand(-1, T, T, -1),
-                            text_exp.expand(-1, T, T, -1)], dim=-1)    # [B, T, T, 2H]
+                            text_exp.expand(-1, T, T, -1)], dim=-1)  # [B, T, T, 2H]
         fusion = torch.tanh(fusion)
 
-        textual_att = self.att_linear_2(fusion).squeeze(-1)            # [B, T, T]
+        textual_att = self.att_linear_2(fusion).squeeze(-1)  # [B, T, T]
         textual_att = torch.softmax(textual_att, dim=-1)
-        att_text_features = torch.matmul(textual_att, text_features)   # [B, T, H]
+        att_text_features = torch.matmul(textual_att, text_features)  # [B, T, H]
 
         return att_text_features, att_img_features
 
@@ -101,10 +101,9 @@ class CoAttentionBlock(nn.Module):
         return text_feats, img_feats
 
 
-
-
 class GMF(nn.Module):
     """Gated Multimodal Fusion (GMF)"""
+
     def __init__(self, hidden_dim):
         super(GMF, self).__init__()
         self.hidden_dim = hidden_dim
@@ -129,6 +128,22 @@ class GMF(nn.Module):
         return multimodal_features
 
 
+class AdapterFusion(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.down_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.activation = nn.ReLU()
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, text_feat, img_feat):  # [B, T, H], [B, T, H]
+        concat_feat = torch.cat([text_feat, img_feat], dim=-1)  # [B, T, 2H]
+        adapter_out = self.activation(self.down_proj(concat_feat))  # [B, T, H]
+        gate = self.gate(text_feat)  # 可改为 gated(image_feat)
+        return text_feat + gate * adapter_out  # residual 加权融合
+
 
 class MultimodalNER(nn.Module):
     def __init__(self,
@@ -136,18 +151,16 @@ class MultimodalNER(nn.Module):
                  image_encoder_path="clip-patch32",
                  num_labels=9,
                  hidden_dim=768,
-                 max_seq_len=128,
-                 num_img_region=1,
                  dropout_rate=0.3,
                  use_image=True):  # ✅ 添加控制图像模态的开关
         super(MultimodalNER, self).__init__()
-
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.use_image = use_image
 
         self.text_hidden_size = hidden_dim
 
-        self.roberta = RobertaModel.from_pretrained(text_encoder_path)
-        self.clip = CLIPModel.from_pretrained(image_encoder_path)
+        self.roberta = RobertaModel.from_pretrained(os.path.join(self.script_dir, text_encoder_path))
+        self.clip = CLIPModel.from_pretrained(os.path.join(self.script_dir, image_encoder_path))
         self.clip.eval()
         self.clip_proj = nn.Linear(self.clip.config.projection_dim, self.text_hidden_size)
 
@@ -155,7 +168,7 @@ class MultimodalNER(nn.Module):
 
         self.co_attention = CoAttentionBlock(hidden_dim=self.text_hidden_size)
         self.gmf = GMF(hidden_dim=self.text_hidden_size)
-
+        self.adapter_fusion = AdapterFusion(hidden_dim=self.text_hidden_size)
         self.bilstm = nn.LSTM(input_size=self.text_hidden_size,
                               hidden_size=hidden_dim // 2,
                               num_layers=1,
@@ -182,7 +195,8 @@ class MultimodalNER(nn.Module):
             att_text_feat, att_img_feat = self.co_attention(text_feat, image_feat)
 
             # 图像特征与文本特征融合
-            fused_feat = self.gmf(att_text_feat, att_img_feat)
+            # fused_feat = self.gmf(att_text_feat, att_img_feat)
+            fused_feat = self.adapter_fusion(att_text_feat, att_img_feat)
         else:
             # 如果不使用图像，就只用文本特征（self-attention 已由 RoBERTa 给出）
             fused_feat = text_feat
