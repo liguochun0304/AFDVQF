@@ -207,10 +207,9 @@ data/MNRE
 data/MORE
 data/twitter2015
 data/twitter2017
-data/NewsMKG
+
 clip-patch32
 chinese-roberta-www-ext
 roberta-base
 
 swanlog
-save_models

@@ -1,7 +1,7 @@
 python ../train.py \
   --device "cuda:0" \
   --epochs 100 \
-  --batch_size 128 \
+  --batch_size 64 \
   --drop_prob 0.3 \
   --downs_en_lr 3e-4 \
   --weight_decay_rate 0.01 \
@@ -13,7 +13,11 @@ python ../train.py \
   --patience_num 20 \
   --text_encoder "roberta-base" \
   --image_encoder "clip-patch32" \
-  --dataset_name "twitter2017" \
-  --ex_project "MNER_Ablation_study" \
-  --ex_name "our" \
-  --ex_nums 0
+  --dataset_name "twitter2015" \
+  --ex_project "MNER_Baseline_Comparison" \
+  --ex_name "test_use_adapter" \
+  --ex_nums 0 \
+  --fusion_type adapter \
+  --use_coattention \
+  --use_image \
+  --use_bilstm

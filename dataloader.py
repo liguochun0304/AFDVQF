@@ -17,14 +17,15 @@ class MultimodalNERDataset(Dataset):
     def __init__(self, dataset, tokenizer, processor, max_length=128, dataset_type="train"):
         self.samples = []
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(self.script_dir,'data', dataset, f"{dataset_type}.jsonl"), 'r', encoding='utf-8') as f:
+        with open(os.path.join(self.script_dir, 'data', dataset, f"{dataset_type}.jsonl"), 'r', encoding='utf-8') as f:
             for line in f:
                 self.samples.append(json.loads(line.strip()))
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_length = max_length
 
-        self.label2id = json.load(open(os.path.join(self.script_dir,'data', dataset, "label2id.json"), 'r', encoding='utf-8'))
+        self.label2id = json.load(
+            open(os.path.join(self.script_dir, 'data', dataset, "label2id.json"), 'r', encoding='utf-8'))
         self.id2label = {v: k for k, v in self.label2id.items()}
 
     def __len__(self):
@@ -86,7 +87,7 @@ if __name__ == '__main__':
     tokenizer = RobertaTokenizer.from_pretrained("roberta-base")
     clip_processor = CLIPProcessor.from_pretrained("clip-patch32")
 
-    dataset = MultimodalNERDataset("twitter2017", tokenizer, clip_processor,dataset_type="train")
+    dataset = MultimodalNERDataset("twitter2017", tokenizer, clip_processor, dataset_type="train")
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
 
     for batch in dataloader:

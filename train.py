@@ -15,7 +15,8 @@ from seqeval.metrics import f1_score as seq_f1_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import RobertaTokenizer, CLIPProcessor, get_linear_schedule_with_warmup
-
+from transformers import BertConfig
+from transformers import BertTokenizer
 from dataloader import MultimodalNERDataset, collate_fn
 from model import MultimodalNER
 
@@ -83,7 +84,7 @@ def train(config):
     # 初始化实验ex_project
     swanlab.init(
         project=config.ex_project,
-        name=f"{swanlab_name}",
+        name=f"{swanlab_name}_{config.ex_name}",
         config={
             "fin_tuning_lr": config.fin_tuning_lr,
             "clip_lr": config.clip_lr,
@@ -95,10 +96,13 @@ def train(config):
         dir=os.path.join(script_dir, "swanlog")
     )
 
-    save_dir = os.path.join(script_dir, "save_models", swanlab_name)
+    save_dir = os.path.join(script_dir, "save_models", f"{swanlab_name}_{config.ex_name}")
 
     device = torch.device(config.device)
-    tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
+    if config.text_encoder == "bert-base-uncased" or config.text_encoder == "bert-base-uncased":
+        tokenizer = BertTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
+    else:
+        tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
     processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
     train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
@@ -109,7 +113,11 @@ def train(config):
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
 
-    model = MultimodalNER(use_image=config.use_image).to(device)
+    model = MultimodalNER(num_labels=len(train_dataset.id2label), text_encoder_path=config.text_encoder,
+                          use_image=config.use_image,
+                          fusion_type=config.fusion_type,
+                          use_coattention=config.use_coattention,
+                          use_bilstm=config.use_bilstm).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
