@@ -19,10 +19,27 @@ from transformers import BertConfig
 from transformers import BertTokenizer
 from dataloader import MultimodalNERDataset, collate_fn
 from model import MultimodalNER
+import os
+import random
+import numpy as np
+import torch
+
+
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+def set_seed(seed=42):
+    random.seed(seed)                    # Python 随机种子
+    np.random.seed(seed)                 # numpy 随机种子
+    torch.manual_seed(seed)              # CPU torch 随机种子
+    torch.cuda.manual_seed(seed)         # GPU 随机种子
+    torch.cuda.manual_seed_all(seed)     # 多 GPU 情况
 
+    # 保证 CUDA 可复现（但可能会略微降低速度）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    os.environ['PYTHONHASHSEED'] = str(seed)
 def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_metric):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -106,18 +123,35 @@ def train(config):
     processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
     train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                         dataset_type="train")
+                                         mode="train")
     val_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                       dataset_type="valid")
+                                       mode="valid")
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
+    #
+    # dataset = MultimodalNERDataset(
+    #     data_path="data/twitter2017",
+    #     tokenizer=tokenizer,
+    #     processor=clip_processor,
+    #     max_length=128,
+    #     mode="train"
+    # )
+    #
+    # dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+    #
+    #
+    # train_dataset = MultimodalNERDataset(data_path=config.dataset_name, mode="train")
+    # train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    #
+    # val_dataset = MultimodalNERDataset(data_path=config.dataset_name, mode="valid")
+    # val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=True)
 
     model = MultimodalNER(num_labels=len(train_dataset.id2label), text_encoder_path=config.text_encoder,
                           use_image=config.use_image,
                           fusion_type=config.fusion_type,
                           use_coattention=config.use_coattention,
-                          use_bilstm=config.use_bilstm).to(device)
+                          ).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
@@ -248,5 +282,6 @@ def train(config):
 if __name__ == "__main__":
     from config import get_config
 
+    set_seed(42)
     config = get_config()
     train(config)

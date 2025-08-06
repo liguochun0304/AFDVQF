@@ -1,1 +1,1 @@
-python ../test.py --save_name "2025-08-01_train-twitter2017_ex0_test_use_adapter" --device cuda:0
+python ../test.py --save_name "2025-08-04_train-twitter2017_ex0_test_use_adapter" --device cuda:0

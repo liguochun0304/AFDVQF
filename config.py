@@ -37,11 +37,9 @@ def get_config():
     parser.add_argument("--ex_name", type=str, default="add atpter twitter2017 test")
     parser.add_argument("--ex_nums", type=int, default=0)
 
-    # parser.add_argument("--use_image", type=bool, default=True)
-    parser.add_argument('--fusion_type', type=str, default='adapter', choices=['adapter', 'gmf', 'concat'],
-                        help='融合方式：adapter / gmf / concat')
+
+    parser.add_argument('--fusion_type', action='store_true', help='是否使用 融合模块')
     parser.add_argument('--use_coattention', action='store_true', help='是否使用 Co-Attention 模块')
     parser.add_argument('--use_image', action='store_true', help='是否使用图像模态')
-    parser.add_argument('--use_bilstm', action='store_true', help='是否使用 BiLSTM 模块')
 
     return parser.parse_args()

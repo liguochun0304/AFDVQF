@@ -112,7 +112,7 @@ def main():
         tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
     processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
-    test_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, config.max_len, dataset_type="test")
+    test_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, config.max_len, mode="test")
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
 
     # model = MultimodalNER(text_encoder_path=config.text_encoder, use_image=config.use_image).to(device)
@@ -120,8 +120,7 @@ def main():
     model = MultimodalNER(num_labels=len(test_dataset.id2label), text_encoder_path=config.text_encoder,
                           use_image=config.use_image,
                           fusion_type=config.fusion_type,
-                          use_coattention=config.use_coattention,
-                          use_bilstm=config.use_bilstm).to(device)
+                          use_coattention=config.use_coattention).to(device)
     model_path = os.path.join(script_dir, "save_models", args.save_name, "model.pt")
     model.load_state_dict(torch.load(model_path, map_location=device))
 
