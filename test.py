@@ -119,8 +119,9 @@ def main():
     
     model = MultimodalNER(num_labels=len(test_dataset.id2label), text_encoder_path=config.text_encoder,
                           use_image=config.use_image,
-                          fusion_type=config.fusion_type,
-                          use_coattention=config.use_coattention).to(device)
+                          # fusion_type=config.fusion_type,
+                          # use_coattention=config.use_coattention
+                          ).to(device)
     model_path = os.path.join(script_dir, "save_models", args.save_name, "model.pt")
     model.load_state_dict(torch.load(model_path, map_location=device))
 
