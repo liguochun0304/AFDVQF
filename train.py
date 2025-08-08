@@ -123,34 +123,17 @@ def train(config):
     processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
     train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                         mode="train")
+                                         dataset_type="train")
     val_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                       mode="valid")
+                                       dataset_type="valid")
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
-    #
-    # dataset = MultimodalNERDataset(
-    #     data_path="data/twitter2017",
-    #     tokenizer=tokenizer,
-    #     processor=clip_processor,
-    #     max_length=128,
-    #     mode="train"
-    # )
-    #
-    # dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
-    #
-    #
-    # train_dataset = MultimodalNERDataset(data_path=config.dataset_name, mode="train")
-    # train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
-    #
-    # val_dataset = MultimodalNERDataset(data_path=config.dataset_name, mode="valid")
-    # val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=True)
 
     model = MultimodalNER(num_labels=len(train_dataset.id2label), text_encoder_path=config.text_encoder,
                           use_image=config.use_image,
-                          fusion_type=config.fusion_type,
-                          use_coattention=config.use_coattention,
+                          # fusion_type=config.fusion_type,
+                          # use_coattention=config.use_coattention,
                           ).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
@@ -197,7 +180,7 @@ def train(config):
             "lr": config.downs_en_lr,
         },
     ]
-    # optimizer = torch.optim.AdamW(grouped_params, lr=config.downs_en_lr, weight_decay=config.weight_decay_rate)
+
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
     t_total = len(train_loader) // config.gradient_accumulation_steps * config.epochs
     warmup_steps = int(t_total * config.warmup_prop)

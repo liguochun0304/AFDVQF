@@ -112,7 +112,7 @@ def main():
         tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
     processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
 
-    test_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, config.max_len, mode="test")
+    test_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, config.max_len, dataset_type="test")
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
 
     # model = MultimodalNER(text_encoder_path=config.text_encoder, use_image=config.use_image).to(device)
