@@ -25,6 +25,7 @@ def get_chunks(seq, tags):
     default = tags['O']
     idx_to_tag = {idx: tag for tag, idx in tags.items()}
     chunks = []
+    # chunk_type用于判断是什么类型，LOC,PER
     chunk_type, chunk_start = None, None
     for i, tok in enumerate(seq):
         # End of a chunk 1
@@ -36,6 +37,8 @@ def get_chunks(seq, tags):
 
         # End of a chunk + start of a chunk!
         elif tok != default:
+            # tok_chunk_class 判断是以B开头还是I开头
+            # tok_chunk_type 判断是什么类型，PER,LOC
             tok_chunk_class, tok_chunk_type = get_chunk_type(tok, idx_to_tag)
             if chunk_type is None:
                 chunk_type, chunk_start = tok_chunk_type, i
@@ -49,7 +52,6 @@ def get_chunks(seq, tags):
     if chunk_type is not None:
         chunk = (chunk_type, chunk_start, len(seq))
         chunks.append(chunk)
-
     return chunks
 
 
@@ -67,6 +69,7 @@ def get_chunk_type(tok, idx_to_tag):
     return tag_class, tag_type
 
 
+# def run_evaluate(self, sess, test, tags):
 # def run_evaluate(self, sess, test, tags):
 def evaluate(labels_pred, labels, words, tags):
     """
@@ -111,6 +114,7 @@ def evaluate(labels_pred, labels, words, tags):
     acc = np.mean(accs)
 
     # file_write.close()
+    # return acc, f1,p,r, correct_preds, total_preds, total_correct
     return acc, f1, p, r
 
 

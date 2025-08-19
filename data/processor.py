@@ -88,8 +88,8 @@ def convert_bio_block_to_json(block, image_base_dir):
         parts = line.strip().split()
 
         # ✅ 跳过 http 或 https 开头的网址
-        if len(parts) >= 1 and parts[0].startswith("http"):
-            continue
+        # if len(parts) >= 1 and parts[0].startswith("http"):
+        #     continue
 
         if len(parts) == 1:
             token = parts[0]
@@ -108,7 +108,7 @@ def convert_bio_block_to_json(block, image_base_dir):
     else:
         text = "".join(tokens)
 
-    print("\n")
+    # print("\n")
     # ✅ 额外检查：tokens 和 labels 长度是否一致
     assert len(tokens) == len(labels), f"Token 和 Label 数量不一致：{tokens}, {labels}"
 
@@ -157,21 +157,7 @@ def convert_and_merge_by_img(input_file, output_file, image_prefix="twitter2017/
             line = line.strip()
             if not line:
                 continue
-            # 替换非法 json 引号（如果是单引号）
-            # line = line.replace("'", '"')
-            # data = json.loads(line)
-
             data = json5.loads(line)
-
-            # 如果 relation 是字符串 "None"，你可能想把它当成 null
-            # if data.get("relation") == "None":
-            #     data["relation"] = None
-
-            # try:
-            #     pass
-            # except Exception as e:
-            #     print(f"跳过解析错误行: {e}")
-            #     continue
             grouped[data["img_id"]].append(data)
 
     # Step 2: 每个 img_id 合并处理
@@ -186,7 +172,6 @@ def convert_and_merge_by_img(input_file, output_file, image_prefix="twitter2017/
             h_pos = data["h"]["pos"]
             relation = data["relation"]
 
-            # if relation == None: continue
 
             # 初始化全O标签
             head_label = relation.strip("/").split("/")[0].upper()

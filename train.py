@@ -6,40 +6,40 @@
 # @Email   ：liguochun0304@163.com
 import json
 import os
+import random
 from datetime import datetime
 
+import numpy as np
 import swanlab
 import torch
-from seqeval.metrics import classification_report as seq_classification_report
-from seqeval.metrics import f1_score as seq_f1_score
+
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from tqdm import tqdm
-from transformers import RobertaTokenizer, CLIPProcessor, get_linear_schedule_with_warmup
-from transformers import BertConfig
-from transformers import BertTokenizer
-from dataloader import MultimodalNERDataset, collate_fn
-from model import MultimodalNER
-import os
-import random
-import numpy as np
-import torch
+from transformers import get_linear_schedule_with_warmup
 
-
+from dataloader import MMPNERDataset, collate_fn_span, MMPNERProcessor
+from model import build_model
+from test import evaluate_model
+from test import load_config
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+
 def set_seed(seed=42):
-    random.seed(seed)                    # Python 随机种子
-    np.random.seed(seed)                 # numpy 随机种子
-    torch.manual_seed(seed)              # CPU torch 随机种子
-    torch.cuda.manual_seed(seed)         # GPU 随机种子
-    torch.cuda.manual_seed_all(seed)     # 多 GPU 情况
+    random.seed(seed)  # Python 随机种子
+    np.random.seed(seed)  # numpy 随机种子
+    torch.manual_seed(seed)  # CPU torch 随机种子
+    torch.cuda.manual_seed(seed)  # GPU 随机种子
+    torch.cuda.manual_seed_all(seed)  # 多 GPU 情况
 
     # 保证 CUDA 可复现（但可能会略微降低速度）
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+
 def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_metric):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -65,43 +65,14 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
     return state["epoch"], state["best_f1"]
 
 
-def evaluate(model, val_loader, device, id2label):
-    model.eval()
-    all_preds, all_labels = [], []
-
-    with torch.no_grad():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            image_tensor = batch["image_tensor"].to(device)
-
-            # 预测的标签 id 序列
-            preds = model(input_ids, attention_mask, image_tensor)
-
-            for p_ids, l_ids, mask in zip(preds, labels, attention_mask):
-                valid_len = mask.sum().item()
-                # 截取有效 token，映射成标签字符串
-                pred_labels = [id2label[i] for i in p_ids[:valid_len]]
-                true_labels = [id2label[i.item()] for i in l_ids[:valid_len]]
-
-                all_preds.append(pred_labels)
-                all_labels.append(true_labels)
-
-    # 实体级别评估
-    f1 = seq_f1_score(all_labels, all_preds)
-    report = seq_classification_report(all_labels, all_preds, zero_division=0, digits=4, output_dict=True)
-    return f1, report
-
-
 def train(config):
     print("train config:", config)
-    swanlab_name = f"{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_ex{str(config.ex_nums)}"
+    swanlab_name = f"{datetime.now().strftime('%Y-%m-%d')}_train-{config.dataset_name}_{str(config.model)}_{config.ex_name}"
     print("train pth save name and swanlab name is", swanlab_name)
     # 初始化实验ex_project
     swanlab.init(
         project=config.ex_project,
-        name=f"{swanlab_name}_{config.ex_name}",
+        name=f"{swanlab_name}",
         config={
             "fin_tuning_lr": config.fin_tuning_lr,
             "clip_lr": config.clip_lr,
@@ -110,76 +81,146 @@ def train(config):
             "batch_size": config.batch_size,
             "epochs": config.epochs
         },
+        mode="offline",
         dir=os.path.join(script_dir, "swanlog")
     )
 
-    save_dir = os.path.join(script_dir, "save_models", f"{swanlab_name}_{config.ex_name}")
+    save_dir = os.path.join(script_dir, "save_models", f"{swanlab_name}")
 
     device = torch.device(config.device)
-    if config.text_encoder == "bert-base-uncased" or config.text_encoder == "bert-base-uncased":
-        tokenizer = BertTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
+
+    DATA_PATH = {
+        "twitter2015": {
+            # text data
+            'train': 'data/twitter2015/train.txt',
+            'valid': 'data/twitter2015/valid.txt',
+            'test': 'data/twitter2015/test.txt',
+        },
+        "twitter2017": {
+            # text data
+            'train': 'data/twitter2017/train.txt',
+            'valid': 'data/twitter2017/valid.txt',
+            'test': 'data/twitter2017/test.txt',
+        }
+    }
+    # image data
+    IMG_PATH = {
+        'twitter2015': 'data/twitter2015/twitter2015_images',
+        'twitter2017': 'data/twitter2017/twitter2017_images',
+    }
+    img_path = IMG_PATH[config.dataset_name]
+    data_path = DATA_PATH[config.dataset_name]
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])])
+    processor = MMPNERProcessor(data_path, config.text_encoder)
+    train_dataset = MMPNERDataset(
+        processor, transform, img_path=img_path, max_seq=config.max_len,
+        sample_ratio=1.0, mode='train', return_span=True
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=64, shuffle=True, num_workers=1, pin_memory=True,
+        collate_fn=collate_fn_span
+    )
+
+    val_dataset = MMPNERDataset(
+        processor,
+        transform,
+        img_path=img_path,
+        max_seq=config.max_len,
+        sample_ratio=1.0,
+        mode='valid'
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,  # 验证集不打乱
+        num_workers=4,
+        pin_memory=True
+    )
+
+    config.num_labels = len(train_dataset.label_mapping)
+
+    start_epoch = 0
+    best_f1 = 0.0
+    if config.continue_train_name == "None":
+        # 正常首次训练
+        model = build_model(config).to(device)
     else:
-        tokenizer = RobertaTokenizer.from_pretrained(os.path.join(script_dir, config.text_encoder))
-    processor = CLIPProcessor.from_pretrained(os.path.join(script_dir, config.image_encoder))
+        SAVE_ROOT = os.path.join(script_dir, "save_models")
+        # 从 save_models/<name> 读取先前 config 以确保结构一致
+        ckpt_dir = os.path.join(SAVE_ROOT, config.continue_train_name)
+        prev_cfg = load_config(config.continue_train_name)  # 你已有的函数
 
-    train_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                         dataset_type="train")
-    val_dataset = MultimodalNERDataset(config.dataset_name, tokenizer, processor, max_length=config.max_len,
-                                       dataset_type="valid")
-
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, collate_fn=collate_fn)
-
-    model = MultimodalNER(num_labels=len(train_dataset.id2label), text_encoder_path=config.text_encoder,
-                          use_image=config.use_image,
-                          # fusion_type=config.fusion_type,
-                          # use_coattention=config.use_coattention,
-                          ).to(device)
+        # 用先前配置构建结构，但运行参数沿用当前命令行（比如新的 LR/drop/align 等）
+        model = build_model(prev_cfg).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
-    param_optimizer = list(model.named_parameters())
-    # 模块分类
-    param_roberta = [(n, p) for n, p in param_optimizer if "text_encoder" in n]
-    param_clip = [(n, p) for n, p in param_optimizer if "image_encoder" in n]
-    param_downstream = [(n, p) for n, p in param_optimizer if "text_encoder" not in n and "image_encoder" not in n]
+    # ---- 互斥划分参数：确保同一个 tensor 只落在一个组里 ----
+    param_roberta, param_clip, param_downstream = [], [], []
+    for n, p in model.named_parameters():
+        if n.startswith("text_encoder."):
+            param_roberta.append((n, p))
+        elif n.startswith("clip_vision.") or n.startswith("clip.vision_model."):
+            # 兼容两种命名：你自己模块里的 clip_vision.*，以及 transformers 的 clip.vision_model.*
+            param_clip.append((n, p))
+        else:
+            param_downstream.append((n, p))
 
-    # 构造 optimizer_grouped_parameters
-    optimizer_grouped_parameters = [
-        # Roberta
-        {
-            "params": [p for n, p in param_roberta if not any(nd in n for nd in no_decay)],
-            "weight_decay": config.weight_decay_rate,
-            "lr": config.fin_tuning_lr,
-        },
-        {
-            "params": [p for n, p in param_roberta if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-            "lr": config.fin_tuning_lr,
-        },
-        # CLIP
-        {
-            "params": [p for n, p in param_clip if not any(nd in n for nd in no_decay)],
-            "weight_decay": config.weight_decay_rate,
-            "lr": config.clip_lr,
-        },
-        {
-            "params": [p for n, p in param_clip if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-            "lr": config.clip_lr,
-        },
-        # 下游模块
-        {
-            "params": [p for n, p in param_downstream if not any(nd in n for nd in no_decay)],
-            "weight_decay": config.weight_decay_rate,
-            "lr": config.downs_en_lr,
-        },
-        {
-            "params": [p for n, p in param_downstream if any(nd in n for nd in no_decay)],
-            "weight_decay": 0.0,
-            "lr": config.downs_en_lr,
-        },
-    ]
+    # 小工具：给某一类(named params)按有/无weight_decay切分，跳过不需要训练的参数
+    def build_groups(named_params, lr, wd):
+        params_decay = [p for n, p in named_params
+                        if p.requires_grad and not any(nd in n for nd in no_decay)]
+        params_nodec = [p for n, p in named_params
+                        if p.requires_grad and any(nd in n for nd in no_decay)]
+        groups = []
+        if len(params_decay) > 0:
+            groups.append({"params": params_decay, "weight_decay": wd, "lr": lr})
+        if len(params_nodec) > 0:
+            groups.append({"params": params_nodec, "weight_decay": 0.0, "lr": lr})
+        return groups
+
+    optimizer_grouped_parameters = []
+    # RoBERTa（文本编码器）
+    optimizer_grouped_parameters += build_groups(param_roberta,
+                                                 config.fin_tuning_lr,
+                                                 config.weight_decay_rate)
+    # 下游模块
+    optimizer_grouped_parameters += build_groups(param_downstream,
+                                                 config.downs_en_lr,
+                                                 config.weight_decay_rate)
+    # CLIP视觉塔（仅在 --vision_trainable 时加入优化器）
+    if getattr(config, "vision_trainable", False):
+        optimizer_grouped_parameters += build_groups(param_clip,
+                                                     config.clip_lr,
+                                                     config.weight_decay_rate)
+
+    # ---- 去重校验（防止任何参数出现在多个组）----
+    seen = set()
+    for gi, g in enumerate(optimizer_grouped_parameters):
+        for p in g["params"]:
+            pid = id(p)
+            if pid in seen:
+                raise ValueError(f"parameter appears in multiple groups (group index {gi})")
+            seen.add(pid)
+
+    # （可选）打印快照，方便确认分组是否合理
+    def count_params(named_params):
+        return sum(p.numel() for _, p in named_params)
+
+    print("\n[DEBUG] param grouping snapshot")
+    print(" - roberta  tensors:", len(param_roberta), " params:", count_params(param_roberta))
+    print(" - clip     tensors:", len(param_clip), " params:", count_params(param_clip),
+          " (vision_trainable=", getattr(config, "vision_trainable", False), ")")
+    print(" - downstream tensors:", len(param_downstream), " params:", count_params(param_downstream))
+    print()
+
+    # optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
 
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
     t_total = len(train_loader) // config.gradient_accumulation_steps * config.epochs
@@ -189,18 +230,48 @@ def train(config):
     best_f1 = 0.0
     patience_counter = 0
 
-    for epoch in range(1, config.epochs + 1):
+    # =============== 加载 checkpoint（模型权重 / 或完整状态） ===============
+    if config.continue_train_name != "None":
+        load_dir = ckpt_dir
+        model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt")))
+        optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt")))
+        scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt")))
+
+        with open(os.path.join(load_dir, "training_state.json")) as f:
+            state = json.load(f)
+        start_epoch = state["epoch"]
+        best_f1 = state["best_f1"]
+
+    for epoch in range(start_epoch, config.epochs + 1):
         model.train()
         total_loss = 0.0
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}", ncols=100)
         for step, batch in enumerate(loop):
+
+            # input_ids = batch[0].to(device, non_blocking=True)
+            # # token_type_ids = batch[1].to(device, non_blocking=True)
+            # attention_mask = batch[1].to(device, non_blocking=True)
+            # labels = batch[2].to(device, non_blocking=True)
+            # image_tensor = batch[3].to(device, non_blocking=True)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            image_tensor = batch["image_tensor"].to(device)
+            labels = batch["labels"].to(device)  # 仍可用于 token-CE 辅助或旧评测
+            images = batch.get("image", None)
+            if images is not None: images = images.to(device)
 
-            loss = model(input_ids, attention_mask, image_tensor, labels)
+            span_starts = batch["span_starts"].to(device)
+            span_ends = batch["span_ends"].to(device)
+            span_types = batch["span_types"].to(device)
+            span_mask = batch["span_mask"].to(device)
+
+            # loss = model(input_ids, attention_mask, image_tensor, labels)
+
+            loss = model(input_ids, attention_mask, image_tensor=images,
+                                      labels=None,  # 或者 labels 若开了 aux_ce
+                                      span_starts=span_starts, span_ends=span_ends,
+                                      span_types=span_types, span_mask=span_mask)
+
             loss = loss / config.gradient_accumulation_steps
             loss.backward()
 
@@ -237,14 +308,15 @@ def train(config):
         swanlab.log({"train/loss": avg_loss})
         print(f"\n✅ Epoch {epoch} Train Loss: {avg_loss:.4f}")
 
-        f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
+        # f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
+        acc, f1, p, r = evaluate_model(model, val_loader, device, train_dataset.label_mapping)
         print(
-            f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {report['weighted avg']['precision']:.4f} recall: {report['weighted avg']['recall']:.4f}")
+            f"🎯Epoch {epoch} Eval F1: {f1:.4f} precision: {p:.4f} recall: {r:.4f} acc:{acc:4f}")
 
         swanlab.log({
             "eval/f1": f1,
-            "eval/precision": report["weighted avg"]["precision"],
-            "eval/recall": report["weighted avg"]["recall"],
+            "eval/precision": p,
+            "eval/recall": r,
             "epoch": epoch
         })
 
