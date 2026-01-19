@@ -29,7 +29,7 @@ def get_config():
     parser.add_argument("--patience", type=float, default=0.00001)
     parser.add_argument("--patience_num", type=int, default=20)
 
-    parser.add_argument("--text_encoder", type=str, default="roberta-base")
+    parser.add_argument("--text_encoder", type=str, default="chinese-roberta-www-ext")
     parser.add_argument("--image_encoder", type=str, default="clip-patch32")
     parser.add_argument("--dataset_name", type=str, default="twitter2017")
 
@@ -70,5 +70,21 @@ def get_config():
     # 模型结构控制参数
     parser.add_argument("--unfreeze_last_vision_blocks", type=int, default=2,
                         help="微调时解冻最后的视觉 encoder block 数")
+
+    # ============ 双粒度视觉编码器参数 ============
+    parser.add_argument('--use_dual_granularity', action='store_true',
+                        help='是否使用双粒度视觉编码器替代CLIP')
+    parser.add_argument("--vision_img_size", type=int, default=224,
+                        help="双粒度编码器输入图像尺寸")
+    parser.add_argument("--vision_patch_size", type=int, default=16,
+                        help="双粒度编码器patch大小")
+    parser.add_argument("--vision_depth", type=int, default=6,
+                        help="双粒度编码器细粒度transformer层数（推荐6层）")
+    parser.add_argument("--vision_max_patches", type=int, default=196,
+                        help="最大patch数量（14x14=196）")
+    parser.add_argument("--vision_delegate_topk", type=int, default=32,
+                        help="Delegate Block选择的重要patch数量")
+    parser.add_argument("--vision_swin_window", type=int, default=7,
+                        help="Swin Transformer窗口大小")
 
     return parser.parse_args()

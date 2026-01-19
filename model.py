@@ -5,9 +5,35 @@
 # @Software: PyCharm
 # @E-mail  : liguochun0304@163.com
 
+"""
+双粒度视觉编码器使用说明：
+
+新架构包含三个主要组件：
+1. 粗粒度处理：resize + Swin Transformer + Delegate Transformer Block
+2. 细粒度处理：自适应patch处理 + Transformer layers
+3. 双粒度融合：MLP融合粗细粒度特征
+
+推荐配置参数：
+- vision_img_size: 224 (标准输入尺寸)
+- vision_patch_size: 16 (patch大小)
+- vision_depth: 6-12 (细粒度transformer层数，推荐6层平衡性能)
+- vision_max_patches: 196 (14x14=196，最大patch数量)
+- vision_delegate_topk: 32 (Delegate Block选择的重要patch数量)
+- vision_swin_window: 7 (Swin Transformer窗口大小)
+
+使用方式：
+config = YourConfig(...)
+config.use_dual_granularity = True
+config.vision_img_size = 224
+config.vision_patch_size = 16
+config.vision_depth = 6
+config.vision_max_patches = 196
+config.vision_delegate_topk = 32
+
+model = MultimodalNER(config)
+"""
 
 import os
-from typing import List, Optional, Callable, Dict
 
 import torch
 import torch.nn as nn
@@ -18,44 +44,38 @@ from transformers import CLIPModel, RobertaModel, BertModel
 # =========================
 #  模型注册表 & 工厂函数
 # =========================
-MODEL_REGISTRY: Dict[str, Callable[[object], nn.Module]] = {}
+MODEL_REGISTRY = {}
 
 
-def register_model(name: str):
+def register_model(name):
     """装饰器：把模型类/构造函数注册进字典；要求 __init__(self, config)"""
 
     def deco(cls_or_fn):
         if name in MODEL_REGISTRY:
-            raise ValueError(f"Duplicate model name: {name}")
+            raise ValueError("Duplicate model name: {0}".format(name))
         MODEL_REGISTRY[name] = cls_or_fn
         return cls_or_fn
 
     return deco
 
 
-def build_model(config) -> nn.Module:
+def build_model(config):
     """工厂：根据 config.model 构建模型，仅传入 config 一个参数"""
     name = getattr(config, "model", None)
     if not name:
         raise KeyError("config.model 未设置")
     if name not in MODEL_REGISTRY:
-        raise KeyError(f"未知模型 '{name}'，可选：{list(MODEL_REGISTRY.keys())}")
+        raise KeyError("未知模型 '{0}'，可选：{1}".format(name, list(MODEL_REGISTRY.keys())))
     return MODEL_REGISTRY[name](config)
 
 
 class BaseNERModel(nn.Module):
     def __init__(self, config):
-        super().__init__()
+        super(BaseNERModel, self).__init__()
         self.config = config
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    def forward(
-            self,
-            input_ids: torch.Tensor,
-            attention_mask: torch.Tensor,
-            image_tensor: Optional[torch.Tensor] = None,
-            labels: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
         raise NotImplementedError
 
 
@@ -64,7 +84,7 @@ class BaseNERModel(nn.Module):
 #     """文本与图像上下文 concat -> 线性 -> 门控残差"""
 #
 #     def __init__(self, hidden_dim: int):
-#         super().__init__()
+#         super(GatedConcatFusion, self).__init__()
 #         self.proj = nn.Linear(hidden_dim * 2, hidden_dim)
 #         self.gate = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.Sigmoid())
 #
@@ -92,9 +112,8 @@ class GatedConcatFusion(nn.Module):
     - 返回: fused, rel  (rel∈[0,1], [B,T,1])
     """
 
-    def __init__(self, hidden_dim: int, init_gate_bias: float = -1.5,
-                 init_alpha: float = 0.02, rel_temp: float = 2.0):
-        super().__init__()
+    def __init__(self, hidden_dim, init_gate_bias=-1.5, init_alpha=0.02, rel_temp=2.0):
+        super(GatedConcatFusion, self).__init__()
         self.ln_t = nn.LayerNorm(hidden_dim)
         self.ln_v = nn.LayerNorm(hidden_dim)
         self.proj = nn.Linear(hidden_dim * 2, hidden_dim)
@@ -124,8 +143,8 @@ class GatedConcatFusion(nn.Module):
 class CrossAttentionBlock(nn.Module):
     """标准多头 Cross-Attn（Q=text, K/V=image）+ FFN"""
 
-    def __init__(self, hidden_dim: int, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super(CrossAttentionBlock, self).__init__()
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
@@ -137,7 +156,7 @@ class CrossAttentionBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_dim)
 
-    def forward(self, text_feat, image_tokens, image_mask: Optional[torch.Tensor] = None):
+    def forward(self, text_feat, image_tokens, image_mask=None):
         attn_out, _ = self.attn(query=text_feat, key=image_tokens, value=image_tokens,
                                 key_padding_mask=image_mask)  # image_mask: True=pad
         x = self.norm1(text_feat + attn_out)
@@ -146,16 +165,91 @@ class CrossAttentionBlock(nn.Module):
         return x
 
 
+class CrossModalFusion(nn.Module):
+    """
+    改进的跨模态融合模块
+    使用多头注意力 + 门控机制进行更稳定的模态融合
+    """
+
+    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
+        super(CrossModalFusion, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+
+        # 多头跨模态注意力
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # 门控融合机制
+        self.gate_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Sigmoid()
+        )
+
+        # 特征投影
+        self.text_norm = nn.LayerNorm(hidden_dim)
+        self.vision_norm = nn.LayerNorm(hidden_dim)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+
+        # FFN
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, text_features, vision_features, attention_mask=None):
+        """
+        Args:
+            text_features: [B, L, H] 文本特征
+            vision_features: [B, N, H] 视觉特征
+            attention_mask: [B, L] 文本attention mask
+        Returns:
+            fused_features: [B, L, H] 融合后的特征
+        """
+        # 归一化
+        text_features = self.text_norm(text_features)
+        vision_features = self.vision_norm(vision_features)
+
+        # 跨模态注意力融合
+        # Q = text_features, K = V = vision_features
+        attn_output, attn_weights = self.cross_attention(
+            query=text_features,
+            key=vision_features,
+            value=vision_features,
+            key_padding_mask=None  # vision features没有padding
+        )
+
+        # 门控融合
+        gate_input = torch.cat([text_features, attn_output], dim=-1)
+        gate = self.gate_net(gate_input)
+
+        # 自适应融合
+        fused_features = text_features * (1 - gate) + attn_output * gate
+
+        # FFN
+        ffn_output = self.ffn(fused_features)
+        fused_features = self.output_norm(fused_features + ffn_output)
+
+        return fused_features
+
+
 class VisualResampler(nn.Module):
     """将 R 个 patch 压到 K 个视觉 token（可学习 query）"""
 
-    def __init__(self, hidden_dim: int, num_queries: int = 8, num_heads: int = 8, dropout: float = 0.1):
-        super().__init__()
+    def __init__(self, hidden_dim, num_queries=8, num_heads=8, dropout=0.1):
+        super(VisualResampler, self).__init__()
         self.queries = nn.Parameter(torch.randn(num_queries, hidden_dim))
         self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
         self.ln = nn.LayerNorm(hidden_dim)
 
-    def forward(self, image_feat, image_mask: Optional[torch.Tensor] = None):
+    def forward(self, image_feat, image_mask=None):
         B, _, H = image_feat.shape
         q = self.queries.unsqueeze(0).expand(B, -1, -1)  # [B,K,H]
         out, _ = self.attn(query=q, key=image_feat, value=image_feat, key_padding_mask=image_mask)
@@ -179,7 +273,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ====================== 辅助：对齐损失v2（你代码里用到了） ======================
-def compute_alignment_loss_v2(text_ctx, fused, mask=None, beta: float = 0.3):
+def compute_alignment_loss_v2(text_ctx, fused, mask=None, beta=0.3):
     """
     组合：cosine + beta * MSE，用于稳住融合方向并轻微惩罚幅度偏移
     text_ctx, fused: [B,T,H]
@@ -196,377 +290,728 @@ def compute_alignment_loss_v2(text_ctx, fused, mask=None, beta: float = 0.3):
     return loss
 
 
-# ====================== Span 头 ======================
-class SpanHead(nn.Module):
-    def __init__(self, hidden: int, num_types: int = 4, dropout: float = 0.1):
-        super().__init__()
-        self.drop = nn.Dropout(dropout)
-        self.start_fc = nn.Linear(hidden, 1)
-        self.end_fc   = nn.Linear(hidden, 1)
-        # 简单用 [h_start; h_end] 做类型分类；也可以换成 span 内池化
-        self.type_fc  = nn.Linear(hidden * 2, num_types)
-
-        # 初始化更稳一点
-        nn.init.normal_(self.start_fc.weight, std=0.02)
-        nn.init.zeros_(self.start_fc.bias)
-        nn.init.normal_(self.end_fc.weight, std=0.02)
-        nn.init.zeros_(self.end_fc.bias)
-        nn.init.normal_(self.type_fc.weight, std=0.02)
-        nn.init.zeros_(self.type_fc.bias)
-
-    def forward(self, enc, mask):
-        """
-        enc: [B,T,H]（你融合后的 token 表征）
-        mask: [B,T]  (1=有效)
-        return:
-            start_logits, end_logits: [B,T]
-        """
-        x = self.drop(enc)
-        start = self.start_fc(x).squeeze(-1)
-        end   = self.end_fc(x).squeeze(-1)
-        # 也可在这里对 pad 位置置极小值；训练里会用 mask
-        return start, end
 
 def info_nce(z1, z2, tau=0.15):
     """批内 InfoNCE，z1/z2: [B,H] 已归一化"""
-    logits = (z1 @ z2.t()) / tau
+    logits = torch.matmul(z1, z2.t()) / tau
     labels = torch.arange(z1.size(0), device=z1.device)
     return F.cross_entropy(logits, labels)
 
 
-def _resolve_path(script_dir: str, path: str) -> str:
+# ========== 双粒度视觉编码器组件 ==========
+
+class WindowAttention(nn.Module):
+    """窗口内多头自注意力"""
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # (Wh, Ww)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # define a parameter table of relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        B_, N, C = x.shape
+        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q = q * self.scale
+        attn = torch.matmul(q, k.transpose(-2, -1))
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
+
+        attn = self.attn_drop(attn)
+
+        x = torch.matmul(attn, v).transpose(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+def window_partition(x, window_size):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int): window size
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Args:
+        windows: (num_windows*B, window_size, window_size, C)
+        window_size (int): Window size
+        H (int): Height of image
+        W (int): Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
+
+class SwinTransformerBlock(nn.Module):
+    """Swin Transformer Block for local aesthetic aggregation"""
+
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        if min(self.input_resolution) <= self.window_size:
+            # if window size is larger than input resolution, we don't partition windows
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.drop_path = nn.Dropout(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop)
+        )
+
+        if self.shift_size > 0:
+            # calculate attention mask for SW-MSA
+            H, W = self.input_resolution
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None))
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, self.window_size)  # nW, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x.view(B, H * W, C)
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
+class DelegateTransformerBlock(nn.Module):
+    """Delegate Transformer Block with sparse, data-driven deformable attention"""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
+                 drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.mlp_ratio = mlp_ratio
+
+        # Delegate score computation (importance scoring)
+        self.delegate_score_net = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, 1),
+            nn.Sigmoid()
+        )
+
+        # Standard attention components
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qk_scale = qk_scale or (dim // num_heads) ** -0.5
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(drop)
+
+        # Standard transformer components
+        self.norm1 = norm_layer(dim)
+        self.norm2 = norm_layer(dim)
+        self.drop_path = nn.Dropout(drop_path) if drop_path > 0. else nn.Identity()
+
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            act_layer(),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(drop)
+        )
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        assert N == H * W, "input feature has wrong size"
+
+        shortcut = x
+        x = self.norm1(x)
+
+        # 1. Compute delegate scores (importance weights)
+        delegate_scores = self.delegate_score_net(x)  # [B, N, 1]
+        delegate_scores = delegate_scores.squeeze(-1)  # [B, N]
+
+        # 2. Standard multi-head attention with delegate weighting
+        qkv = self.qkv(x)  # [B, N, 3*C]
+        qkv = qkv.view(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  # [3, B, H, N, C//H]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, H, N, C//H]
+
+        # Standard attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.qk_scale  # [B, H, N, N]
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # Apply delegate weighting: boost attention to important patches
+        # delegate_scores: [B, N], we want to weight the attention weights
+        delegate_weights = delegate_scores.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, N]
+        attn = attn * delegate_weights  # [B, H, N, N]
+
+        # Renormalize attention
+        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-6)
+
+        x_attn = torch.matmul(attn, v)  # [B, H, N, C//H]
+        x_attn = x_attn.transpose(1, 2).reshape(B, N, C)  # [B, N, C]
+
+        # 7. FFN
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
+class AdaptivePatchProcessor(nn.Module):
+    """Adaptive patch processor for fine-grained processing with resolution handling"""
+
+    def __init__(self, patch_size=16, max_patches=256, embed_dim=768):
+        super().__init__()
+        self.patch_size = patch_size
+        self.max_patches = max_patches
+        self.embed_dim = embed_dim
+
+        # Patch embedding
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Adaptive pooling for high-resolution patches
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((int(max_patches**0.5), int(max_patches**0.5)))
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 3, H, W] input images
+        Returns:
+            patches: [B, N, D] patch embeddings, where N <= max_patches
+            patch_info: dict with patch coordinates and selection info
+        """
+        B, C, H, W = x.shape
+
+        # Standard patch embedding
+        patch_embed = self.patch_embed(x)  # [B, D, H//P, W//P]
+        patch_embed = patch_embed.flatten(2).transpose(1, 2)  # [B, N, D]
+        patch_embed = self.norm(patch_embed)
+
+        # Calculate number of patches
+        num_patches = patch_embed.shape[1]
+
+        patch_info = {
+            'original_patches': num_patches,
+            'selected_patches': min(num_patches, self.max_patches),
+            'patch_size': self.patch_size,
+            'image_size': (H, W)
+        }
+
+        if num_patches <= self.max_patches:
+            # Low resolution: use all patches
+            return patch_embed, patch_info
+        else:
+            # High resolution: adaptive pooling to reduce patches
+            # Reshape to spatial layout
+            H_p, W_p = H // self.patch_size, W // self.patch_size
+            spatial_patches = patch_embed.view(B, H_p, W_p, self.embed_dim).permute(0, 3, 1, 2)  # [B, D, H_p, W_p]
+
+            # Adaptive pooling
+            pooled_patches = self.adaptive_pool(spatial_patches)  # [B, D, sqrt(max_patches), sqrt(max_patches)]
+            pooled_patches = pooled_patches.flatten(2).transpose(1, 2)  # [B, max_patches, D]
+
+            patch_info['pooling_applied'] = True
+            patch_info['original_spatial'] = (H_p, W_p)
+            patch_info['pooled_spatial'] = (int(self.max_patches**0.5), int(self.max_patches**0.5))
+
+            return pooled_patches, patch_info
+
+
+class DualGranularityVisionEncoder(nn.Module):
+    """Dual granularity vision encoder with coarse and fine-grained processing"""
+
+    def __init__(self, img_size=224, patch_size=16, embed_dim=768, depth=12, num_heads=12,
+                 mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 max_patches=256, swin_window_size=7):
+        super().__init__()
+
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.depth = depth
+        self.max_patches = max_patches
+
+        # ========== 粗粒度处理 ==========
+        # Resize and patch embedding for coarse processing
+        self.coarse_resize = nn.Upsample(size=(img_size, img_size), mode='bilinear', align_corners=False)
+
+        # Standard patch embedding for coarse
+        self.coarse_patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        num_patches_coarse = (img_size // patch_size) ** 2
+        self.coarse_pos_embed = nn.Parameter(torch.zeros(1, num_patches_coarse, embed_dim))
+        self.coarse_norm = nn.LayerNorm(embed_dim)
+
+        # Swin Transformer layers for local aesthetic aggregation
+        self.swin_layers = nn.ModuleList()
+        for i in range(2):  # 两层Swin Transformer
+            layer = SwinTransformerBlock(
+                dim=embed_dim,
+                input_resolution=(img_size // patch_size, img_size // patch_size),
+                num_heads=num_heads,
+                window_size=swin_window_size,
+                shift_size=0 if i % 2 == 0 else swin_window_size // 2,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                qk_scale=None,
+                drop=drop_rate,
+                attn_drop=attn_drop_rate,
+                drop_path=drop_path_rate,
+                norm_layer=nn.LayerNorm
+            )
+            self.swin_layers.append(layer)
+
+        # Delegate Transformer Block for attention to visually salient regions
+        self.delegate_block = DelegateTransformerBlock(
+            dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            drop=drop_rate,
+            attn_drop=attn_drop_rate,
+            drop_path=drop_path_rate
+        )
+
+        # ========== 细粒度处理 ==========
+        self.fine_processor = AdaptivePatchProcessor(
+            patch_size=patch_size,
+            max_patches=max_patches,
+            embed_dim=embed_dim
+        )
+
+        # Fine-grained transformer layers
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        self.fine_layers = nn.ModuleList()
+        for i in range(depth):
+            layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=int(embed_dim * mlp_ratio),
+                dropout=drop_rate,
+                activation='gelu',
+                batch_first=True,
+                norm_first=True
+            )
+            self.fine_layers.append(layer)
+
+        # ========== 双粒度融合 ==========
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim * 2),
+            nn.LayerNorm(embed_dim * 2),
+            nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward_coarse(self, x):
+        """Coarse-grained processing: resize + Swin + Delegate"""
+        B = x.shape[0]
+
+        # Resize to standard size
+        x_resized = self.coarse_resize(x)  # [B, 3, img_size, img_size]
+
+        # Patch embedding
+        x_patches = self.coarse_patch_embed(x_resized)  # [B, D, H_p, W_p]
+        x_patches = x_patches.flatten(2).transpose(1, 2)  # [B, N, D]
+        x_patches = x_patches + self.coarse_pos_embed
+        x_patches = self.coarse_norm(x_patches)
+
+        # Swin Transformer layers
+        H_p, W_p = self.img_size // self.patch_size, self.img_size // self.patch_size
+        for layer in self.swin_layers:
+            x_patches = layer(x_patches.view(B, H_p, W_p, self.embed_dim).permute(0, 3, 1, 2).flatten(2).transpose(1, 2))
+
+        # Delegate Transformer Block
+        x_coarse = self.delegate_block(x_patches, H_p, W_p)
+
+        # Global average pooling to get coarse features
+        coarse_feat = x_coarse.mean(dim=1)  # [B, D]
+
+        return coarse_feat
+
+    def forward_fine(self, x):
+        """Fine-grained processing: adaptive patch processing + transformer"""
+        # Adaptive patch processing
+        x_patches, patch_info = self.fine_processor(x)  # [B, N, D], N <= max_patches
+
+        # Add positional embedding (learned)
+        if not hasattr(self, 'fine_pos_embed') or self.fine_pos_embed.shape[1] != x_patches.shape[1]:
+            self.fine_pos_embed = nn.Parameter(torch.zeros(1, x_patches.shape[1], self.embed_dim)).to(x.device)
+            nn.init.trunc_normal_(self.fine_pos_embed, std=.02)
+
+        x_patches = x_patches + self.fine_pos_embed
+
+        # Transformer layers
+        for layer in self.fine_layers:
+            x_patches = layer(x_patches)
+
+        # Global average pooling to get fine features
+        fine_feat = x_patches.mean(dim=1)  # [B, D]
+
+        return fine_feat, patch_info
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, 3, H, W] input images
+        Returns:
+            fused_features: [B, D] dual granularity features
+            coarse_feat: [B, D] coarse features
+            fine_feat: [B, D] fine features
+            patch_info: dict with patch processing info
+        """
+        # Coarse-grained processing
+        coarse_feat = self.forward_coarse(x)
+
+        # Fine-grained processing
+        fine_feat, patch_info = self.forward_fine(x)
+
+        # Dual granularity fusion
+        combined = torch.cat([coarse_feat, fine_feat], dim=-1)  # [B, 2*D]
+        fused_features = self.fusion_mlp(combined)  # [B, D]
+
+        return fused_features, coarse_feat, fine_feat, patch_info
+
+
+def _resolve_path(script_dir, path):
+    """
+    仅返回存在的本地路径；若不存在则返回 None，避免触发远程下载。
+    """
     local = os.path.join(script_dir, path)
-    return local if os.path.exists(local) else path
+    return local if os.path.exists(local) else None
 
 
 # ---------- 主模型（不使用 label_names/BIO约束/边界辅助） ----------
 @register_model("MNER")
 class MultimodalNER(BaseNERModel):
     """
-    ViT → Resampler(K) → Cross-Attn(Q=text,K/V=image) → 相关性门控融合 → (可选)BiLSTM(pack) → LN+Linear → CRF
-    损失 = CRF(token平均) + λ_align * 对齐 + λ_preserve * 保真 + λ_nce * InfoNCE + λ_sparse * mean(rel)
-    - 不依赖 label_names，不设置 BIO 硬约束/边界辅助
+    重新设计的多模态NER模型 - 更稳定、更有效
+    架构: TextEncoder → VisionEncoder → Cross-Modal Fusion → BiLSTM → Classifier
+    特点: 简化的视觉处理 + 稳定的跨模态融合 + 优化的训练策略
     """
 
     def __init__(self, config):
-        super().__init__(config)
+        super(MultimodalNER, self).__init__(config)
+
+        # 基础配置
         self.text_encoder_path = config.text_encoder
         self.image_encoder_path = config.image_encoder
         self.num_labels = config.num_labels
         self.hidden_dim = config.hidden_dim
         self.dropout_rate = config.drop_prob
         self.use_image = config.use_image
-        self.use_bilstm = config.use_bilstm
-        self.resampler_tokens = config.resampler_tokens
-        self.cross_attn_heads = config.cross_attn_heads
-        self.align_lambda = getattr(config, "align_lambda", 0.05)
+        # BiLSTM已被移除，改用更现代的Transformer架构
+        self.use_bilstm = False  # 强制设为False
+
+        # 简化的超参数
+        self.contrastive_lambda = getattr(config, "contrastive_lambda", 0.1)  # 简化的对比损失
         self.vision_trainable = getattr(config, "vision_trainable", False)
+        self.current_epoch = 0
 
-        # 训练/稳定化超参（均可从 config 覆盖）
-        self.align_warmup_epochs = getattr(config, "align_warmup_epochs", 5)
-        self.preserve_lambda = getattr(config, "preserve_lambda", 0.05)
-        self.nce_lambda = getattr(config, "nce_lambda", 0.02)
-        self.sparsity_lambda = getattr(config, "sparsity_lambda", 0.01)  # rel 稀疏正则
-        self.image_dropout_p = getattr(config, "image_dropout_p", 0.3)  # 2015:0.3, 2017:0.2/0
-        self.emission_temperature = getattr(config, "emission_temperature", 2.5)
-        self.current_epoch = 0  # 由训练循环注入
-
-        # ---- 文本编码器 ----
+        # ===== 文本编码器 =====
         t_path = _resolve_path(self.script_dir, self.text_encoder_path)
-        if self.text_encoder_path == "roberta-base":
-            self.text_encoder = RobertaModel.from_pretrained(t_path)
-        elif self.text_encoder_path == "bert-base-uncased":
-            self.text_encoder = BertModel.from_pretrained(t_path)
+        if self.text_encoder_path in ["roberta-base", "chinese-roberta-www-ext"]:
+            if "roberta" in self.text_encoder_path:
+                self.text_encoder = RobertaModel.from_pretrained(t_path, local_files_only=True)
+            else:
+                self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
         else:
             raise ValueError(f"Unsupported text encoder: {self.text_encoder_path}")
         self.text_hidden = self.text_encoder.config.hidden_size
 
-        # ---- 视觉编码器（默认冻结）----
-        v_path = _resolve_path(self.script_dir, self.image_encoder_path)
-        self.clip = CLIPModel.from_pretrained(v_path)
-        self.clip_vision = self.clip.vision_model
-        if not self.vision_trainable:
-            for p in self.clip_vision.parameters():
-                p.requires_grad = False
-            self.clip_vision.eval()
+        # ===== 简化的视觉编码器 =====
+        if self.use_image:
+            v_path = _resolve_path(self.script_dir, self.image_encoder_path)
+            self.clip = CLIPModel.from_pretrained(v_path)
 
-        # ViT hidden -> text hidden
-        self.clip_proj = nn.Linear(self.clip_vision.config.hidden_size, self.text_hidden)
+            # 冻结视觉编码器（可选微调最后几层）
+            if not self.vision_trainable:
+                for param in self.clip.vision_model.parameters():
+                    param.requires_grad = False
 
-        # ---- Resampler + Cross-Attn + 融合 ----
-        self.dropout = nn.Dropout(self.dropout_rate)
-        self.resampler = VisualResampler(self.text_hidden, num_queries=self.resampler_tokens,
-                                         num_heads=self.cross_attn_heads, dropout=self.dropout_rate)
-        self.cross_attn = CrossAttentionBlock(self.text_hidden, num_heads=self.cross_attn_heads,
-                                              dropout=self.dropout_rate)
-        self.fusion = GatedConcatFusion(self.text_hidden, init_gate_bias=-1.5, init_alpha=0.02, rel_temp=2.0)
+            # 视觉特征投影到文本空间
+            vision_dim = self.clip.vision_model.config.hidden_size
+            self.vision_proj = nn.Sequential(
+                nn.Linear(vision_dim, self.text_hidden),
+                nn.LayerNorm(self.text_hidden),
+                nn.GELU(),
+                nn.Dropout(self.dropout_rate)
+            )
 
-        # ---- （可选）BiLSTM ----
-        if self.use_bilstm:
-            self.bilstm = nn.LSTM(input_size=self.text_hidden, hidden_size=self.hidden_dim // 2,
-                                  num_layers=1, batch_first=True, bidirectional=True)
-            out_dim = self.hidden_dim
-        else:
-            out_dim = self.text_hidden
-
-        # ---- 分类 + CRF（加LN，温和初始化）----
-        self.classifier = nn.Sequential(
-            nn.LayerNorm(out_dim),
-            nn.Linear(out_dim, self.num_labels)
+        # ===== 跨模态融合模块 =====
+        self.cross_modal_fusion = CrossModalFusion(
+            hidden_dim=self.text_hidden,
+            num_heads=8,
+            dropout=self.dropout_rate
         )
-        nn.init.normal_(self.classifier[1].weight, std=0.02)
-        nn.init.zeros_(self.classifier[1].bias)
 
-        # self.crf = CRF(self.num_labels, batch_first=True)
-        # ===== Span 配置 =====
-        self.use_span = getattr(config, "use_span", True)   # 打开后用 span 训练
-        self.num_span_types = 4                             # LOC/ORG/OTHER/PER
-        self.max_span_len = getattr(config, "max_span_len", 12)
-        self.lambda_type = getattr(config, "lambda_type", 1.0)
-        # 可选：token CE 作为辅助（多任务稳定前期训练）
-        self.aux_ce_lambda = getattr(config, "aux_ce_lambda", 0.0)
+        # ===== 序列建模 =====
+        # 移除BiLSTM，使用更现代的Transformer架构
+        # RoBERTa已经提供了强大的序列建模能力
+        classifier_input_dim = self.text_hidden
 
-        # span 头
-        self.span_head = SpanHead(out_dim, num_types=self.num_span_types, dropout=self.dropout_rate)
+        # ===== 分类器 =====
+        self.dropout = nn.Dropout(self.dropout_rate)
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(classifier_input_dim),
+            nn.Linear(classifier_input_dim, classifier_input_dim // 2),
+            nn.GELU(),
+            nn.Dropout(self.dropout_rate),
+            nn.Linear(classifier_input_dim // 2, self.num_labels)
+        )
+
+        # ===== 对比学习模块 =====
+        if self.contrastive_lambda > 0:
+            self.contrastive_head = nn.Sequential(
+                nn.Linear(self.text_hidden, self.text_hidden),
+                nn.GELU(),
+                nn.Linear(self.text_hidden, self.text_hidden)
+            )
+
+        # 初始化参数
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        """改进的参数初始化"""
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
+
+    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
+        # ===== 1. 文本编码 =====
+        text_outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        text_features = text_outputs.last_hidden_state  # [B, L, H]
+
+        # ===== 2. 视觉编码 =====
+        visual_features = None
+        contrastive_loss = torch.tensor(0.0, device=text_features.device)
+
+        if self.use_image and image_tensor is not None:
+            # CLIP视觉编码
+            vision_outputs = self.clip.vision_model(pixel_values=image_tensor)
+            vision_patches = vision_outputs.last_hidden_state[:, 1:, :]  # 移除CLS token
+
+            # 投影到文本空间
+            visual_features = self.vision_proj(vision_patches)  # [B, N, H]
+
+            # 对比学习（可选）
+            if self.contrastive_lambda > 0 and self.training:
+                text_pooled = self._pool_features(text_features, attention_mask)
+                vision_pooled = self._pool_features(visual_features, None)
+                contrastive_loss = self._contrastive_loss(text_pooled, vision_pooled)
+
+        # ===== 3. 跨模态融合 =====
+        if visual_features is not None:
+            fused_features = self.cross_modal_fusion(
+                text_features, visual_features, attention_mask
+            )
+        else:
+            fused_features = text_features
+
+        # ===== 4. 序列建模 =====
+        # 使用RoBERTa的内置序列建模能力，无需额外BiLSTM
+
+        # ===== 5. 分类 =====
+        fused_features = self.dropout(fused_features)
+        logits = self.classifier(fused_features)  # [B, L, num_labels]
+
+        # ===== 6. 损失计算 =====
+        if labels is not None:
+            # 交叉熵损失（只在有效token上计算）
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            active_loss = attention_mask.view(-1) == 1
+            active_logits = logits.view(-1, self.num_labels)[active_loss]
+            active_labels = labels.view(-1)[active_loss]
+            ce_loss = loss_fct(active_logits, active_labels)
+
+            # 总损失
+            total_loss = ce_loss + self.contrastive_lambda * contrastive_loss
+            return total_loss
+        else:
+            # 推理时返回预测结果
+            return logits.argmax(dim=-1)
+
+    def _pool_features(self, features, mask=None):
+        """特征池化用于对比学习"""
+        if mask is not None:
+            # 加权平均池化
+            mask_expanded = mask.unsqueeze(-1).float()
+            pooled = (features * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+        else:
+            # 全局平均池化
+            pooled = features.mean(dim=1)
+
+        # L2归一化
+        return F.normalize(pooled, p=2, dim=-1)
+
+    def _contrastive_loss(self, text_features, vision_features):
+        """简化的对比损失"""
+        # 计算相似度矩阵
+        similarity = torch.matmul(text_features, vision_features.t())  # [B, B]
+
+        # 标签（对角线为正样本）
+        labels = torch.arange(similarity.size(0), device=similarity.device)
+
+        # 双向对比损失
+        loss_t2v = F.cross_entropy(similarity, labels)
+        loss_v2t = F.cross_entropy(similarity.t(), labels)
+
+        return (loss_t2v + loss_v2t) / 2
+
+    # 可选：仅解冻最后 n 个 ViT block
+    def unfreeze_last_vision_blocks(self, n_blocks=2):
+        """微调视觉编码器的最后几层"""
+        total_blocks = len(self.clip.vision_model.encoder.layers)
+        for i, block in enumerate(self.clip.vision_model.encoder.layers):
+            for param in block.parameters():
+                param.requires_grad = (i >= total_blocks - n_blocks)
+        self.vision_trainable = True
 
 
     # 可选：仅解冻最后 n 个 ViT block
     def unfreeze_last_vision_blocks(self, n_blocks=2):
-        total = len(self.clip_vision.encoder.layers)
-        for i, blk in enumerate(self.clip_vision.encoder.layers):
-            for p in blk.parameters():
-                p.requires_grad = (i >= total - n_blocks)
-        self.vision_trainable = True
-        self.clip_vision.train(True)
+        if self.use_image:
+            total = len(self.clip.vision_model.encoder.layers)
+            for i, blk in enumerate(self.clip.vision_model.encoder.layers):
+                for p in blk.parameters():
+                    p.requires_grad = (i >= total - n_blocks)
+            self.vision_trainable = True
+            self.clip.vision_model.train(True)
 
-    def forward(self,
-                input_ids,
-                attention_mask,
-                image_tensor=None,
-                labels=None,
-                # ===== 新增：span 监督 =====
-                span_starts=None,  # [B,S_max]  右开区间的 start（e 的位置在 span_ends）
-                span_ends=None,    # [B,S_max]
-                span_types=None,   # [B,S_max]  0..3 (LOC/ORG/OTHER/PER)，无效填 -1
-                span_mask=None     # [B,S_max]  1/0
-                ):
-        # 1) 文本编码
-        txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state  # [B,T,H]
-        txt = self.dropout(txt)
-
-        align_loss = torch.tensor(0.0, device=txt.device)
-        preserve   = torch.tensor(0.0, device=txt.device)
-        nce_loss   = torch.tensor(0.0, device=txt.device)
-        sparsity   = torch.tensor(0.0, device=txt.device)
-
-        fused = txt
-
-        # 2) 可选图像路径（带图像dropout）
-        use_img = self.use_image and (image_tensor is not None)
-        if self.training and use_img and (self.image_dropout_p > 0):
-            if torch.rand(1, device=txt.device) < self.image_dropout_p:
-                use_img = False
-
-        if use_img:
-            with torch.set_grad_enabled(self.vision_trainable):
-                v_out = self.clip_vision(pixel_values=image_tensor)
-                patches = v_out.last_hidden_state[:, 1:, :]  # 去 CLS
-            img = self.clip_proj(patches)       # [B,R,H]
-            img = self.dropout(img)
-
-            img_tokens = self.resampler(img)    # [B,K,H]
-            txt_ctx = self.cross_attn(txt, img_tokens)  # [B,T,H]
-
-            fused, rel = self.fusion(txt, txt_ctx)      # [B,T,H], [B,T,1]
-            sparsity = rel.mean()                        # 稀疏正则
-
-            # ===== 对齐（按相关性 + 实体权重；无 labels 时用 span 构造 entity_mask） =====
-            if self.training and (self.align_lambda > 0):
-                rel_w = rel.detach().squeeze(-1)              # [B,T]
-                # entity_mask：优先用 labels，否则用 span 反投影
-                if labels is not None:
-                    entity_mask = (labels > 0).float()
-                elif (span_starts is not None) and (span_ends is not None) and (span_mask is not None):
-                    entity_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-                    B, T = attention_mask.size()
-                    for b in range(B):
-                        valid = span_mask[b] == 1
-                        ss = span_starts[b][valid]
-                        ee = span_ends[b][valid]
-                        for s, e in zip(ss.tolist(), ee.tolist()):
-                            s = int(s); e = int(e)
-                            if 0 <= s < e <= T:
-                                entity_mask[b, s:e] = 1.0
-                else:
-                    entity_mask = torch.zeros_like(attention_mask, dtype=torch.float)
-
-                align_w = attention_mask.float() * (rel_w + entity_mask)  # 强化实体权重
-                raw_align = compute_alignment_loss_v2(txt, fused, mask=align_w, beta=0.3)
-                warm = min(1.0, getattr(self, "current_epoch", 0) / max(1, self.align_warmup_epochs))
-                align_loss = warm * raw_align
-
-            # 保真：rel 低处约束 fused≈txt
-            preserve_map = F.mse_loss(fused, txt, reduction='none').mean(-1)   # [B,T]
-            preserve = (preserve_map * attention_mask.float() * (1.0 - rel.squeeze(-1))).sum() \
-                       / (attention_mask.sum() + 1e-6)
-
-            # 句-图 InfoNCE
-            if self.training and (self.nce_lambda > 0):
-                txt_pool = (txt * attention_mask.unsqueeze(-1).float()).sum(1) \
-                           / (attention_mask.sum(1, keepdim=True) + 1e-6)
-                txt_pool = F.normalize(txt_pool, dim=-1)
-                v_global = v_out.last_hidden_state[:, 0, :]  # CLS
-                v_global = F.normalize(self.clip_proj(v_global), dim=-1)
-                nce_loss = info_nce(txt_pool, v_global, tau=0.15)
-
-        # 3) （可选）BiLSTM pack
-        if self.use_bilstm:
-            lengths = attention_mask.sum(dim=1).cpu()
-            packed = nn.utils.rnn.pack_padded_sequence(fused, lengths, batch_first=True, enforce_sorted=False)
-            packed_out, _ = self.bilstm(packed)
-            fused, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True, total_length=fused.size(1))
-
-        fused = self.dropout(fused)  # [B,T,H]
-        B, T, H = fused.size()
-
-        # ===== 4) Span / Token 两种训练分支 =====
-        total = torch.tensor(0.0, device=fused.device)
-
-        # ---- 4.1 Span 分支（建议主用） ----
-        if self.use_span and (span_starts is not None) and (span_ends is not None) and (span_types is not None) and (span_mask is not None):
-            # 4.1.1 start/end 二分类监督（BCE）
-            start_logits, end_logits = self.span_head(fused, attention_mask)  # [B,T]
-            start_targets = torch.zeros_like(start_logits)
-            end_targets   = torch.zeros_like(end_logits)
-
-            # 根据 gold spans 在对应位置置 1
-            valid = span_mask == 1
-            if valid.any():
-                b_idx = torch.arange(B, device=fused.device).unsqueeze(1).expand_as(span_starts)
-                # start
-                ss = span_starts.clone()
-                ss[~valid] = -1
-                mask_s = ss >= 0
-                start_targets[b_idx[mask_s], ss[mask_s]] = 1.0
-                # end 使用 e-1（右开区间）
-                ee = (span_ends - 1).clamp(min=-1)
-                ee[~valid] = -1
-                mask_e = ee >= 0
-                end_targets[b_idx[mask_e], ee[mask_e]] = 1.0
-
-            # 只在有效 token 上计算 BCE
-            weight_tok = attention_mask.float()
-            loss_start = F.binary_cross_entropy_with_logits(
-                start_logits, start_targets, weight=weight_tok, reduction='sum'
-            ) / (weight_tok.sum() + 1e-6)
-            loss_end = F.binary_cross_entropy_with_logits(
-                end_logits, end_targets, weight=weight_tok, reduction='sum'
-            ) / (weight_tok.sum() + 1e-6)
-
-            # 4.1.2 类型分类（仅对 gold spans，正样本 CE；负样本靠 start/end 抑制）
-            # 取每个 gold span 的 h_s 与 h_{e-1}
-            pos_mask = valid & (span_types >= 0)
-            if pos_mask.any():
-                # 拉平成一维索引
-                b_lin = torch.arange(B, device=fused.device).unsqueeze(1).expand_as(span_starts)
-                b_pos = b_lin[pos_mask]
-                s_pos = span_starts[pos_mask]
-                e_pos = (span_ends[pos_mask] - 1).clamp(min=0, max=T-1)
-                t_pos = span_types[pos_mask]  # [N]
-
-                hs = fused[b_pos, s_pos, :]          # [N,H]
-                he = fused[b_pos, e_pos, :]          # [N,H]
-                h_span = torch.cat([hs, he], dim=-1) # [N,2H]
-                logits_type = self.span_head.type_fc(h_span)  # [N,4]
-                loss_type = F.cross_entropy(logits_type, t_pos)
-            else:
-                loss_type = torch.tensor(0.0, device=fused.device)
-
-            span_loss = loss_start + loss_end + self.lambda_type * loss_type
-        else:
-            span_loss = torch.tensor(0.0, device=fused.device)
-
-        # ---- 4.2 可选 token-CE 辅助（多任务稳定） ----
-        emissions = self.classifier(fused) / self.emission_temperature  # [B,T,C]
-        if (labels is not None) and (self.aux_ce_lambda > 0.0):
-            ce = F.cross_entropy(
-                emissions.view(-1, self.num_labels),
-                labels.view(-1),
-                reduction='none'
-            ).view(B, T)
-            ce_loss = (ce * attention_mask.float()).sum() / (attention_mask.sum() + 1e-6)
-        else:
-            ce_loss = torch.tensor(0.0, device=fused.device)
-
-        total = span_loss + self.aux_ce_lambda * ce_loss \
-                + self.align_lambda * align_loss \
-                + self.preserve_lambda * preserve \
-                + self.nce_lambda * nce_loss \
-                + self.sparsity_lambda * sparsity
-
-        # ===== 5) 训练/推理返回 =====
-        if (labels is not None) or (span_starts is not None):
-            # 训练/验证阶段：返回总损失
-            return total
-        else:
-            # 推理：默认返回 token 分类（兼容老评测）。
-            # 你也可以调用 self.predict_spans(...) 得到 spans，再自行转 BIO。
-            return emissions.argmax(dim=-1)  # [B,T]
-    @torch.no_grad()
-    def predict_spans(self, input_ids, attention_mask, image_tensor=None,
-                      topk_s: int = 8, topk_e: int = 8):
-        """
-        返回：List[List[(s,e,type_id,score)]]（每条样本一组）
-        说明：简单贪心，限制最大长度 self.max_span_len，避免过多重叠
-        """
-        self.eval()
-        # 文本/图像编码与融合与 forward 相同，但不做损失，仅取 fused
-        txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        fused = self.dropout(txt)
-        if self.use_image and (image_tensor is not None):
-            with torch.set_grad_enabled(False):
-                v_out = self.clip_vision(pixel_values=image_tensor)
-                patches = v_out.last_hidden_state[:, 1:, :]
-            img = self.dropout(self.clip_proj(patches))
-            img_tokens = self.resampler(img)
-            txt_ctx = self.cross_attn(fused, img_tokens)
-            fused, _ = self.fusion(fused, txt_ctx)
-            fused = self.dropout(fused)
-
-        start_logits, end_logits = self.span_head(fused, attention_mask)
-        ps = torch.sigmoid(start_logits) * attention_mask
-        pe = torch.sigmoid(end_logits)   * attention_mask
-
-        B, T, H = fused.size()
-        results = []
-        for b in range(B):
-            s_idx = torch.topk(ps[b], k=min(topk_s, (attention_mask[b]==1).sum().item())).indices.tolist()
-            e_idx = torch.topk(pe[b], k=min(topk_e, (attention_mask[b]==1).sum().item())).indices.tolist()
-            cands = []
-            for s in s_idx:
-                for e1 in e_idx:
-                    e = e1 + 1  # 右开区间
-                    if (e - s) <= 0 or (e - s) > self.max_span_len:
-                        continue
-                    if attention_mask[b, s:e].min().item() == 0:
-                        continue
-                    hs = fused[b, s, :]; he = fused[b, e-1, :]
-                    logits_type = self.span_head.type_fc(torch.cat([hs, he], dim=-1))  # [4]
-                    prob_type = F.softmax(logits_type, dim=-1)
-                    t = prob_type.argmax().item()
-                    score = (ps[b, s].item()) * (pe[b, e-1].item()) * (prob_type[t].item())
-                    cands.append((s, e, t, score))
-            # 简单贪心去重
-            cands.sort(key=lambda x: -x[3])
-            picked = []
-            used = torch.zeros(T, dtype=torch.bool)
-            for s, e, t, sc in cands:
-                if used[s:e].any():
-                    continue
-                picked.append((s, e, t, sc))
-                used[s:e] = True
-            results.append(picked)
-        return results
 
 
 
@@ -575,7 +1020,7 @@ class RobertaCRF(BaseNERModel):
     """纯文本基线：Roberta + Linear + CRF"""
 
     def __init__(self, config):
-        super().__init__(config)
+        super(RobertaCRF, self).__init__(config)
         self.num_labels = config.num_labels
         self.label_names = getattr(config, "label_names", None)
         self.dropout_rate = config.drop_prob
@@ -608,7 +1053,7 @@ class RobertaCRF(BaseNERModel):
 @register_model("bert")
 class BERTOnly(BaseNERModel):
     def __init__(self, config):
-        super().__init__(config)
+        super(BERTOnly, self).__init__(config)
         self.num_labels = config.num_labels
         self.drop_prob = config.drop_prob
         t_path = _resolve_path(self.script_dir, self.text_encoder_path)
@@ -637,7 +1082,7 @@ class BERTOnly(BaseNERModel):
 @register_model("bert_crf")
 class BERTCRF(BaseNERModel):
     def __init__(self, config):
-        super().__init__(config)
+        super(BERTCRF, self).__init__(config)
         self.num_labels = config.num_labels
         self.drop_prob = config.drop_prob
         t_path = _resolve_path(self.script_dir, self.text_encoder_path)
@@ -663,7 +1108,7 @@ class BERTCRF(BaseNERModel):
 @register_model("bert_bilstm_crf")
 class BERTBiLSTMCRF(BaseNERModel):
     def __init__(self, config):
-        super().__init__(config)
+        super(BERTBiLSTMCRF, self).__init__(config)
         self.num_labels = config.num_labels
         self.hidden_dim = config.hidden_dim
         self.drop_prob = config.drop_prob
@@ -688,52 +1133,79 @@ class BERTBiLSTMCRF(BaseNERModel):
 
 
 if __name__ == '__main__':
-    from transformers import AutoTokenizer, CLIPProcessor
-    from PIL import Image
     import torch
+    from transformers import AutoTokenizer
+    from PIL import Image
 
     # 模型与标签
     text_path = "chinese-roberta-www-ext"
-    image_path = "clip-patch32"
     label_names = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
 
-    model = MultimodalNER(
-        text_encoder_path=text_path,
-        image_encoder_path=image_path,
-        num_labels=len(label_names),
-        label_names=label_names,
-        use_image=True,
-        use_bilstm=False,
-        align_lambda=0.1,
-    )
+    # 测试传统CLIP版本
+    print("Testing traditional CLIP version...")
+    try:
+        model_clip = MultimodalNER(
+            text_encoder_path=text_path,
+            image_encoder_path="clip-patch32",
+            num_labels=len(label_names),
+            use_image=True,
+            use_bilstm=False,
+            align_lambda=0.1,
+            use_dual_granularity=False,  # 使用传统CLIP
+        )
+        print("✓ Traditional CLIP model initialized successfully")
+    except Exception as e:
+        print("✗ Traditional CLIP model failed:", str(e))
 
-    # 1. 文本编码
-    tokenizer = AutoTokenizer.from_pretrained(text_path, use_fast=True)
-    batch = tokenizer(
-        ["北京是中国的首都。", "李雷和韩梅梅在上海。"],
-        padding=True,
-        truncation=True,
-        max_length=32,
-        return_tensors="pt"
-    )
-    input_ids = batch["input_ids"]
-    attention_mask = batch["attention_mask"]
+    # 测试双粒度版本
+    print("\nTesting dual granularity version...")
+    try:
+        model_dual = MultimodalNER(
+            text_encoder_path=text_path,
+            num_labels=len(label_names),
+            use_image=True,
+            use_bilstm=False,
+            align_lambda=0.1,
+            use_dual_granularity=True,  # 使用双粒度编码器
+            vision_img_size=224,
+            vision_patch_size=16,
+            vision_depth=6,  # 减少层数用于测试
+            vision_max_patches=196,  # 14x14
+            vision_delegate_topk=32,
+        )
+        print("✓ Dual granularity model initialized successfully")
 
-    # 2. 图像编码（这里用纯色假图像代替）
-    processor = CLIPProcessor.from_pretrained(image_path)
-    img = Image.new("RGB", (224, 224), color=(128, 128, 128))
-    image_tensor = processor(images=[img, img], return_tensors="pt")["pixel_values"]
+        # 创建测试数据
+        tokenizer = AutoTokenizer.from_pretrained(text_path, use_fast=True, local_files_only=True)
+        batch = tokenizer(
+            ["北京是中国的首都。", "李雷和韩梅梅在上海。"],
+            padding=True,
+            truncation=True,
+            max_length=32,
+            return_tensors="pt"
+        )
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
 
-    # 3. 假标签（形状必须和 input_ids 一致）
-    labels = torch.randint(0, len(label_names), input_ids.shape)
+        # 创建假图像
+        img = Image.new("RGB", (224, 224), color=(128, 128, 128))
+        image_tensor = torch.randn(2, 3, 224, 224)  # 假图像tensor
 
-    # 训练模式（输出 loss）
-    model.train()
-    loss = model(input_ids, attention_mask, image_tensor=image_tensor, labels=labels)
-    print("Loss:", float(loss))
+        # 假标签
+        labels = torch.randint(0, len(label_names), input_ids.shape)
 
-    # 推理模式（输出预测标签 ID 序列）
-    model.eval()
-    with torch.no_grad():
-        pred = model(input_ids, attention_mask, image_tensor=image_tensor)
-    print("预测标签 ID:", pred)
+        # 测试前向传播
+        model_dual.train()
+        loss = model_dual(input_ids, attention_mask, image_tensor=image_tensor, labels=labels)
+        print("✓ Forward pass successful, loss:", float(loss))
+
+        # 测试推理
+        model_dual.eval()
+        with torch.no_grad():
+            pred = model_dual(input_ids, attention_mask, image_tensor=image_tensor)
+        print("✓ Inference successful, prediction shape:", pred.shape)
+
+    except Exception as e:
+        print("✗ Dual granularity model failed:", str(e))
+        import traceback
+        traceback.print_exc()

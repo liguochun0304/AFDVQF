@@ -1,7 +1,7 @@
 python3 ../train.py \
   --device "cuda:0" \
   --epochs 50 \
-  --batch_size 128 \
+  --batch_size 64 \
   --drop_prob 0.1 \
   --clip_lr 1e-5 \
   --fin_tuning_lr 5e-5 \

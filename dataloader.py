@@ -25,10 +25,10 @@ from model import _resolve_path
 
 logger = logging.getLogger(__name__)
 
-# ===== Span 类型映射（Twitter2015/2017：LOC/ORG/OTHER/PER）=====
-TYPE2ID_SPAN = {"LOC": 0, "ORG": 1, "OTHER": 2, "PER": 3}
+# ===== Span 类型映射（支持 OTHER/MISC 同一类）=====
+TYPE2ID_SPAN = {"LOC": 0, "ORG": 1, "OTHER": 2, "MISC": 2, "PER": 3}
 
-def bio_ids_to_spans(label_ids, id2tag, x_token_id: int):
+def bio_ids_to_spans(label_ids, id2tag, x_token_id):
     """
     将“未加 [CLS]/[SEP]”的 BIO 标签序列转为 spans（右开区间）。
     - label_ids: 展开到子词后的标签id序列（子词续接位是 'X'）
@@ -45,11 +45,9 @@ def bio_ids_to_spans(label_ids, id2tag, x_token_id: int):
             continue
         tag = id2tag.get(lid, "O")
         if tag.startswith("B-"):
-            ent = tag.split("-")[1]  # 'MISC' 在后续会转 OTHER
-            if ent == "MISC":
-                ent = "OTHER"
+            ent = tag.split("-")[1]  # 'MISC' 保持为 MISC
             j = i + 1
-            while j < n and id2tag.get(label_ids[j], "O") == f"I-{ent}":
+            while j < n and id2tag.get(label_ids[j], "O") == "I-{0}".format(ent):
                 j += 1
             spans.append((i, j, ent))
             i = j
@@ -58,15 +56,35 @@ def bio_ids_to_spans(label_ids, id2tag, x_token_id: int):
     return spans
 
 class MMPNERProcessor(object):
-    def __init__(self, data_path, bert_name) -> None:
+    def __init__(self, data_path, bert_name):
         self.data_path = data_path
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
+        def _check_files(base, files):
+            missing = [f for f in files if not os.path.exists(os.path.join(base, f))]
+            if missing:
+                raise ValueError("本地模型缺少必要文件: {0}，请确认目录 {1}".format(missing, base))
+
+        if not bert_name:
+            raise ValueError("text_encoder 未设置，需指定本地模型目录")
         t_path = _resolve_path(self.script_dir, bert_name)
-        if bert_name == "roberta-base":
-            self.tokenizer = RobertaTokenizer.from_pretrained(t_path,do_lower_case=True)
-        elif bert_name == "bert-base-uncased":
-            self.tokenizer = BertTokenizer.from_pretrained(t_path,do_lower_case=True)
+        if not t_path:
+            raise ValueError("text_encoder 路径无效或不存在: {0}".format(bert_name))
+        # 明确仅使用本地权重，避免联网下载
+        print("[MMPNERProcessor] load tokenizer from local: {0}".format(t_path))
+
+        # 根据本地文件类型自适应选择 tokenizer，避免“类不匹配”及 NoneType
+        has_roberta_files = all(os.path.exists(os.path.join(t_path, f)) for f in ["vocab.json", "merges.txt"])
+        has_bert_files = os.path.exists(os.path.join(t_path, "vocab.txt"))
+
+        if has_roberta_files:
+            _check_files(t_path, ["vocab.json", "merges.txt"])
+            self.tokenizer = RobertaTokenizer.from_pretrained(t_path, do_lower_case=True, local_files_only=True)
+        elif has_bert_files:
+            _check_files(t_path, ["vocab.txt"])
+            self.tokenizer = BertTokenizer.from_pretrained(t_path, do_lower_case=True, local_files_only=True)
+        else:
+            raise ValueError("在 {0} 未找到 vocab.json/merges.txt 或 vocab.txt，无法初始化 tokenizer".format(t_path))
         # # t_path = os.path.join(self.script_dir, bert_name)
         # self.tokenizer = BertTokenizer.from_pretrained(t_path,use_fast=True, do_lower_case=True)
 
@@ -80,13 +98,23 @@ class MMPNERProcessor(object):
         logger.info("Loading data from {}".format(load_file))
         with open(os.path.join(self.script_dir, load_file), "r", encoding="utf-8") as f:
             lines = f.readlines()
-            raw_words, raw_targets = [], []
-            raw_word, raw_target = [], []
-            imgs = []
+            raw_words, raw_targets, imgs = [], [], []
+            raw_word, raw_target, cur_img = [], [], None
+
+            def flush_sample():
+                # 若缺失 img 则丢弃该样本，并打印警告
+                if not raw_word and not raw_target:
+                    return
+                if cur_img is None:
+                    logger.warning("样本缺少 IMGID，已跳过一条")
+                    return
+                raw_words.append(list(raw_word))
+                raw_targets.append(list(raw_target))
+                imgs.append(cur_img)
+
             for line in lines:
                 if line.startswith("IMGID:"):
-                    img_id = line.strip().split('IMGID:')[1] + '.jpg'
-                    imgs.append(img_id)
+                    cur_img = line.strip().split('IMGID:')[1] + '.jpg'
                     continue
                 if line != "\n":
                     raw_word.append(line.split('\t')[0])
@@ -95,12 +123,15 @@ class MMPNERProcessor(object):
                         label = label[:2] + 'MISC'
                     raw_target.append(label)
                 else:
-                    raw_words.append(raw_word)
-                    raw_targets.append(raw_target)
-                    raw_word, raw_target = [], []
+                    flush_sample()
+                    raw_word, raw_target, cur_img = [], [], None
 
-        assert len(raw_words) == len(raw_targets) == len(imgs), "{}, {}, {}".format(len(raw_words), len(raw_targets),
-                                                                                    len(imgs))
+            # 文件末尾若无空行，补 flush
+            flush_sample()
+
+        assert len(raw_words) == len(raw_targets) == len(imgs), "{}, {}, {}".format(
+            len(raw_words), len(raw_targets), len(imgs)
+        )
         # sample data, only for low-resource
         if sample_ratio != 1.0:
             sample_indexes = random.choices(list(range(len(raw_words))), k=int(len(raw_words) * sample_ratio))
@@ -114,16 +145,52 @@ class MMPNERProcessor(object):
         return {"words": raw_words, "targets": raw_targets, "imgs": imgs}
 
     def get_label_mapping(self):
-        LABEL_LIST = ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "X", "[CLS]",
-                      "[SEP]"]
-        label_mapping = {label: idx for idx, label in enumerate(LABEL_LIST, 1)}
-        label_mapping["PAD"] = 0
+        """
+        动态构建标签映射：从数据中提取所有出现的标签
+        """
+        # 基础标签（所有数据集都应该有的）
+        base_labels = ["O", "X", "[CLS]", "[SEP]", "PAD"]
+
+        # 从训练数据中提取实际出现的实体标签
+        entity_labels = set()
+        if hasattr(self, 'data_path') and 'train' in self.data_path:
+            try:
+                train_file = os.path.join(self.script_dir, self.data_path['train'])
+                if os.path.exists(train_file):
+                    with open(train_file, "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip() and not line.startswith("IMGID:") and '\t' in line:
+                                label = line.split('\t')[1].strip()
+                                if 'OTHER' in label:
+                                    label = label[:2] + 'MISC'
+                                entity_labels.add(label)
+            except Exception as e:
+                logger.warning("Failed to extract labels from training data: {0}".format(e))
+
+        # 如果没有找到实体标签，使用默认的
+        if not entity_labels:
+            entity_labels = {"B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"}
+
+        # 合并所有标签
+        all_labels = base_labels + sorted(list(entity_labels))
+
+        # 构建映射
+        label_mapping = {}
+        idx = 0
+        label_mapping["PAD"] = idx
+        idx += 1
+
+        for label in all_labels:
+            if label != "PAD" and label not in label_mapping:
+                label_mapping[label] = idx
+                idx += 1
+
         return label_mapping
 
 
 class MMPNERDataset(Dataset):
     def __init__(self, processor, transform, img_path=None, max_seq=40, sample_ratio=1, mode='train',
-                 ignore_idx=0, return_span: bool=False) -> None:
+                 ignore_idx=0, return_span=False):
         self.processor = processor
         self.transform = transform
         self.data_dict = processor.load_from_file(mode, sample_ratio)
@@ -229,6 +296,54 @@ class MMPNERDataset(Dataset):
         else:
             assert len(input_ids) == len(attention_mask) == len(labels)
             return input_ids, attention_mask, labels
+
+def collate_fn(batch):
+    """
+    标准 collate function，用于非 span 模式
+    batch: List[tuple] 或 List[dict]
+    返回: dict with input_ids, attention_mask, labels, image (optional)
+    """
+    if isinstance(batch[0], dict):
+        # 字典格式
+        has_image = "image" in batch[0]
+        input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
+        attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
+        labels = torch.stack([b["labels"] for b in batch], dim=0)
+
+        out = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if has_image:
+            images = torch.stack([b["image"] for b in batch], dim=0)
+            out["image"] = images
+        return out
+    else:
+        # 元组格式: (input_ids, attention_mask, labels) 或 (input_ids, attention_mask, labels, image)
+        if len(batch[0]) == 3:
+            input_ids, attention_mask, labels = zip(*batch)
+            has_image = False
+        elif len(batch[0]) == 4:
+            input_ids, attention_mask, labels, images = zip(*batch)
+            has_image = True
+        else:
+            raise ValueError("Unexpected batch format")
+
+        input_ids = torch.stack(input_ids, dim=0)
+        attention_mask = torch.stack(attention_mask, dim=0)
+        labels = torch.stack(labels, dim=0)
+
+        out = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        if has_image:
+            images = torch.stack(images, dim=0)
+            out["image"] = images
+        return out
+
 
 def collate_fn_span(batch):
     """
