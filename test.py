@@ -17,16 +17,23 @@ from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
 from model import build_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+STORAGE_ROOT = "/root/autodl-fs"
+DATA_ROOT = os.path.join(STORAGE_ROOT, "data")
 
 
 def evaluate_model(model, val_loader, device, tags):
+    print(f"[evaluate] 进入评估模式, batch数量: {len(val_loader)}")
     model.eval()
     all_preds, all_labels, all_words = [], [], []
     idx2tag = {v: k for k, v in tags.items()}
     to_list = lambda x: x.tolist() if hasattr(x, "tolist") else list(x)
 
     with torch.no_grad():
+        batch_idx = 0
         for batch in val_loader:
+            batch_idx += 1
+            if batch_idx % 50 == 0:
+                print(f"[evaluate] 处理进度: {batch_idx}/{len(val_loader)}")
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
@@ -55,6 +62,7 @@ def evaluate_model(model, val_loader, device, tags):
                 all_labels.append(kept_gold)
                 all_words.append([])
 
+    print(f"[evaluate] 完成预测, 样本数: {len(all_preds)}")
     # 总体指标
     acc, f1, p, r = evaluate(all_preds, all_labels, all_words, tags)
 
@@ -72,7 +80,7 @@ def evaluate_model(model, val_loader, device, tags):
 
 
 def load_config(model_dir):
-    config_path = os.path.join(script_dir, "save_models", model_dir, "config.json")
+    config_path = os.path.join(STORAGE_ROOT, "save_models", model_dir, "config.json")
     if not os.path.exists(config_path):
         raise FileNotFoundError("未找到配置文件: {0}".format(config_path))
     with open(config_path, "r") as f:
@@ -81,10 +89,12 @@ def load_config(model_dir):
 
 
 def main():
+    print("[test] 开始测试流程")
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_name", type=str, required=True, help="保存模型name")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
+    print(f"[test] 加载模型: {args.save_name}, device: {args.device}")
 
     config = load_config(args.save_name)
     config.device = args.device
@@ -92,19 +102,19 @@ def main():
 
     DATA_PATH = {
         "twitter2015": {
-            'train': 'data/twitter2015/train.txt',
-            'valid': 'data/twitter2015/valid.txt',
-            'test':  'data/twitter2015/test.txt',
+            'train': os.path.join(DATA_ROOT, 'twitter2015/train.txt'),
+            'valid': os.path.join(DATA_ROOT, 'twitter2015/valid.txt'),
+            'test':  os.path.join(DATA_ROOT, 'twitter2015/test.txt'),
         },
         "twitter2017": {
-            'train': 'data/twitter2017/train.txt',
-            'valid': 'data/twitter2017/valid.txt',
-            'test':  'data/twitter2017/test.txt',
+            'train': os.path.join(DATA_ROOT, 'twitter2017/train.txt'),
+            'valid': os.path.join(DATA_ROOT, 'twitter2017/valid.txt'),
+            'test':  os.path.join(DATA_ROOT, 'twitter2017/test.txt'),
         }
     }
     IMG_PATH = {
-        'twitter2015': 'data/twitter2015/twitter2015_images',
-        'twitter2017': 'data/twitter2017/twitter2017_images',
+        'twitter2015': os.path.join(DATA_ROOT, 'twitter2015/twitter2015_images'),
+        'twitter2017': os.path.join(DATA_ROOT, 'twitter2017/twitter2017_images'),
     }
 
     img_path = IMG_PATH[config.dataset_name]
@@ -117,9 +127,11 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])
     ])
+    print(f"[test] 初始化processor: text_encoder={config.text_encoder}")
     processor = MMPNERProcessor(data_path, config.text_encoder)
 
     # 测试集
+    print(f"[test] 创建测试数据集: dataset={config.dataset_name}, max_len={config.max_len}")
     test_dataset = MMPNERDataset(
         processor, transform,
         img_path=img_path, max_seq=config.max_len,
@@ -136,12 +148,16 @@ def main():
     )
 
     # 模型
+    print(f"[test] 构建模型: {config.model}")
     model = build_model(config).to(device)
-    model_path = os.path.join(script_dir, "save_models", args.save_name, "model.pt")
+    model_path = os.path.join(STORAGE_ROOT, "save_models", args.save_name, "model.pt")
+    print(f"[test] 加载模型权重: {model_path}")
     state = torch.load(model_path, map_location=device)
     model.load_state_dict(state)
+    print("[test] 模型加载完成")
 
     # 评估
+    print("[test] 开始评估")
     acc, f1, p, r = evaluate_model(model, test_loader, device, test_dataset.label_mapping)
     print("[Overall] Acc={0:.4f}, P={1:.4f}, R={2:.4f}, F1={3:.4f}".format(acc, p, r, f1))
 

@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 class MMPNERProcessor(object):
     def __init__(self, data_path, bert_name):
+        print(f"[MMPNERProcessor] 初始化, bert_name={bert_name}")
         self.data_path = data_path
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -50,9 +51,11 @@ class MMPNERProcessor(object):
         if has_roberta_files:
             _check_files(t_path, ["vocab.json", "merges.txt"])
             self.tokenizer = RobertaTokenizer.from_pretrained(t_path, do_lower_case=True, local_files_only=True)
+            print("[MMPNERProcessor] 使用RobertaTokenizer")
         elif has_bert_files:
             _check_files(t_path, ["vocab.txt"])
             self.tokenizer = BertTokenizer.from_pretrained(t_path, do_lower_case=True, local_files_only=True)
+            print("[MMPNERProcessor] 使用BertTokenizer")
         else:
             raise ValueError("在 {0} 未找到 vocab.json/merges.txt 或 vocab.txt，无法初始化 tokenizer".format(t_path))
         # # t_path = os.path.join(self.script_dir, bert_name)
@@ -83,18 +86,24 @@ class MMPNERProcessor(object):
                 imgs.append(cur_img)
 
             for line in lines:
+                line = line.rstrip('\n\r')
                 if line.startswith("IMGID:"):
-                    cur_img = line.strip().split('IMGID:')[1] + '.jpg'
+                    cur_img = line.split('IMGID:')[1].strip() + '.jpg'
                     continue
-                if line != "\n":
-                    raw_word.append(line.split('\t')[0])
-                    label = line.split('\t')[1][:-1]
+                if not line.strip():
+                    flush_sample()
+                    raw_word, raw_target, cur_img = [], [], None
+                    continue
+                parts = line.split('\t', 1)
+                if len(parts) == 2:
+                    raw_word.append(parts[0])
+                    label = parts[1].strip()
                     if 'OTHER' in label:
                         label = label[:2] + 'MISC'
                     raw_target.append(label)
-                else:
-                    flush_sample()
-                    raw_word, raw_target, cur_img = [], [], None
+                elif len(parts) == 1:
+                    raw_word.append(parts[0])
+                    raw_target.append("O")
 
             # 文件末尾若无空行，补 flush
             flush_sample()
@@ -226,6 +235,8 @@ class MMPNERDataset(Dataset):
                 image = Image.open(img_path).convert('RGB')
                 image = self.transform(image)
             except:
+                img_path = os.path.join("/root/autodl-fs", "data", "no_images.jpg")
+                if not os.path.exists(img_path):
                 img_path = os.path.join(self.script_dir, 'data', 'no_images.jpg')
                 image = Image.open(img_path).convert('RGB')
                 image = self.transform(image)

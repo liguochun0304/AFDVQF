@@ -12,7 +12,7 @@ python3 ../train.py \
   --gradient_accumulation_steps 2 \
   --patience 1e-5 \
   --patience_num 20 \
-  --text_encoder "roberta-base" \
+  --text_encoder "bert" \
   --image_encoder "clip-patch32" \
   --dataset_name "twitter2015" \
   --ex_project "mner_experiment" \
@@ -20,13 +20,8 @@ python3 ../train.py \
   --ex_nums "A0" \
   --use_bilstm \
   --use_image \
-  --align_lambda 0.4 \
-  --nce_lambda 0.02 \
-  --preserve_lambda 0.05 \
-  --sparsity_lambda 0.01 \
-  --resampler_tokens 8 \
-  --emission_temperature 2.5 \
-  --align_warmup_epochs 5 \
-  --image_dropout_p 0.3 \
-  --vision_trainable \
-  --unfreeze_last_vision_blocks 2
+  --contrastive_lambda 0.1 \
+  --num_interaction_layers 4 \
+  --num_queries 8 \
+  --use_dynamic_routing \
+  --vision_trainable

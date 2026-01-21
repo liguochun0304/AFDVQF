@@ -9,18 +9,19 @@ import argparse
 
 
 def get_config():
+    print("[config] 开始解析配置参数")
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--max_len", type=int, default=128)
-    parser.add_argument("--drop_prob", type=float, default=0.3)
+    parser.add_argument("--drop_prob", type=float, default=0.25)
 
     parser.add_argument("--clip_lr", type=float, default=1e-5)
-    parser.add_argument("--fin_tuning_lr", type=float, default=5e-5)
-    parser.add_argument("--downs_en_lr", type=float, default=3e-4)
-    parser.add_argument("--weight_decay_rate", type=float, default=0.01)
+    parser.add_argument("--fin_tuning_lr", type=float, default=3e-5)
+    parser.add_argument("--downs_en_lr", type=float, default=4e-4)
+    parser.add_argument("--weight_decay_rate", type=float, default=0.005)
     parser.add_argument("--clip_grad", type=float, default=2.0)
     parser.add_argument("--warmup_prop", type=float, default=0.1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -38,9 +39,7 @@ def get_config():
     parser.add_argument("--ex_nums", type=str, default="A0")
 
     parser.add_argument("--hidden_dim", type=int, default=768)
-    parser.add_argument("--resampler_tokens", type=int, default=8)
     parser.add_argument("--cross_attn_heads", type=int, default=8)
-    parser.add_argument("--align_lambda", type=float, default=0.2)
     parser.add_argument("--vision_trainable", action='store_true', help='')
     parser.add_argument('--use_image', action='store_true', help='是否使用图像模态')
     parser.add_argument('--use_bilstm', action='store_true', help='是否使用双向LSTM')
@@ -48,18 +47,17 @@ def get_config():
     parser.add_argument("--model", type=str, default="MNER",
                         help="可选：roberta_crf | bert_bilstm_crf | roberta_clip_coattn | MNER")
 
-    # 原有 parser.add_argument(...) 后面追加：
     parser.add_argument("--continue_train_name", type=str, default="None",
                         help="保存于 save_models/ 下的目录名，用于继续训练（加载权重或完整状态）")
-    # 对齐、保真、NCE损失控制
-    parser.add_argument("--preserve_lambda", type=float, default=0.05,
-                        help="保真损失的权重系数")
-    parser.add_argument("--nce_lambda", type=float, default=0.02,
-                        help="InfoNCE 损失的权重系数")
-    parser.add_argument("--sparsity_lambda", type=float, default=0.01,
-                        help="rel 稀疏正则项权重")
-    parser.add_argument("--align_warmup_epochs", type=int, default=5,
-                        help="对齐损失 warmup 的前几轮")
+    
+    parser.add_argument("--contrastive_lambda", type=float, default=0.15,
+                        help="对比损失的权重系数")
+    parser.add_argument("--num_interaction_layers", type=int, default=5,
+                        help="多模态交互层数")
+    parser.add_argument("--num_queries", type=int, default=12,
+                        help="QuestionGuidedMining 的查询数量")
+    parser.add_argument("--use_dynamic_routing", action='store_true',
+                        help="是否使用动态路由融合（默认True）")
 
     # 其他训练稳定性参数
     parser.add_argument("--emission_temperature", type=float, default=2.5,
@@ -87,4 +85,6 @@ def get_config():
     parser.add_argument("--vision_swin_window", type=int, default=7,
                         help="Swin Transformer窗口大小")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    print(f"[config] 配置解析完成: device={args.device}, model={args.model}, dataset={args.dataset_name}")
+    return args

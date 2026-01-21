@@ -39,8 +39,15 @@ class BaseNERModel(nn.Module):
 
 
 def _resolve_path(script_dir, path):
-    local = os.path.join(script_dir, path)
-    return local if os.path.exists(local) else None
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path if os.path.exists(path) else None
+    for base in ("/root/autodl-fs", script_dir):
+        cand = os.path.join(base, path)
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 # ==================== RPI-HMIF 核心模块 ====================
