@@ -25,36 +25,6 @@ from model import _resolve_path
 
 logger = logging.getLogger(__name__)
 
-# ===== Span 类型映射（支持 OTHER/MISC 同一类）=====
-TYPE2ID_SPAN = {"LOC": 0, "ORG": 1, "OTHER": 2, "MISC": 2, "PER": 3}
-
-def bio_ids_to_spans(label_ids, id2tag, x_token_id):
-    """
-    将“未加 [CLS]/[SEP]”的 BIO 标签序列转为 spans（右开区间）。
-    - label_ids: 展开到子词后的标签id序列（子词续接位是 'X'）
-    - id2tag:    {id: tag_str}，如 {1:'O', 2:'B-MISC', ...}
-    - x_token_id: label_mapping['X']
-    返回: List[(start, end, type_str)]
-    """
-    spans = []
-    i, n = 0, len(label_ids)
-    while i < n:
-        lid = label_ids[i]
-        if lid == x_token_id:  # 子词续接位，跳过
-            i += 1
-            continue
-        tag = id2tag.get(lid, "O")
-        if tag.startswith("B-"):
-            ent = tag.split("-")[1]  # 'MISC' 保持为 MISC
-            j = i + 1
-            while j < n and id2tag.get(label_ids[j], "O") == "I-{0}".format(ent):
-                j += 1
-            spans.append((i, j, ent))
-            i = j
-        else:
-            i += 1
-    return spans
-
 class MMPNERProcessor(object):
     def __init__(self, data_path, bert_name):
         self.data_path = data_path
@@ -190,7 +160,7 @@ class MMPNERProcessor(object):
 
 class MMPNERDataset(Dataset):
     def __init__(self, processor, transform, img_path=None, max_seq=40, sample_ratio=1, mode='train',
-                 ignore_idx=0, return_span=False):
+                 ignore_idx=0):
         self.processor = processor
         self.transform = transform
         self.data_dict = processor.load_from_file(mode, sample_ratio)
@@ -203,7 +173,6 @@ class MMPNERDataset(Dataset):
         self.mode = mode
         self.sample_ratio = sample_ratio
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.return_span = return_span
 
         # 常用 id
         self.cls_id = self.label_mapping.get("[CLS]")
@@ -238,9 +207,6 @@ class MMPNERDataset(Dataset):
             tokens = tokens[: self.max_seq - 2]
             labels_exp = labels_exp[: self.max_seq - 2]
 
-        # 在“未加特殊符”的 BIO 序列上抽取 spans（右开）
-        spans = bio_ids_to_spans(labels_exp, self.id2tag, x_token_id=self.x_id)
-
         # 编码输入（加 [CLS]/[SEP]）
         encode_dict = self.tokenizer.encode_plus(
             tokens, max_length=self.max_seq, truncation=True, padding='max_length'
@@ -253,16 +219,6 @@ class MMPNERDataset(Dataset):
                  + [self.ignore_idx] * (self.max_seq - len(labels_exp) - 2)
         labels = torch.tensor(labels, dtype=torch.long)
 
-        # 将 spans 整体 +1 偏移（因为前面加了一个 [CLS]）
-        shifted_spans = []
-        for s, e, t_str in spans:
-            ss, ee = s + 1, e + 1
-            # 约束在 [CLS, ..., SEP) 之间（最后一位是 SEP，不可取）
-            if 0 <= ss < ee <= self.max_seq - 1:
-                t_id = TYPE2ID_SPAN.get(t_str, None)
-                if t_id is not None:
-                    shifted_spans.append((ss, ee, t_id))
-
         # 图像读取（保持原逻辑）
         if self.img_path is not None:
             try:
@@ -274,34 +230,15 @@ class MMPNERDataset(Dataset):
                 image = Image.open(img_path).convert('RGB')
                 image = self.transform(image)
 
-            if self.return_span:
-                return {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                    "image": image,
-                    "spans": shifted_spans  # List[(s,e,type_id)]
-                }
-            else:
-                return input_ids, attention_mask, labels, image
+            return input_ids, attention_mask, labels, image
 
         # 无图像分支（保持原接口）
-        if self.return_span:
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-                "spans": shifted_spans
-            }
-        else:
-            assert len(input_ids) == len(attention_mask) == len(labels)
-            return input_ids, attention_mask, labels
+        assert len(input_ids) == len(attention_mask) == len(labels)
+        return input_ids, attention_mask, labels
 
 def collate_fn(batch):
     """
-    标准 collate function，用于非 span 模式
     batch: List[tuple] 或 List[dict]
-    返回: dict with input_ids, attention_mask, labels, image (optional)
     """
     if isinstance(batch[0], dict):
         # 字典格式
@@ -343,61 +280,6 @@ def collate_fn(batch):
             images = torch.stack(images, dim=0)
             out["image"] = images
         return out
-
-
-def collate_fn_span(batch):
-    """
-    batch: List[dict]，键包含：
-      input_ids:[T], attention_mask:[T], labels:[T], image: CxHxW(可选), spans: List[(s,e,type)]
-    返回：
-      - input_ids:   [B,T]
-      - attention_mask:[B,T]
-      - labels:      [B,T]   （token标签，兼容多任务或评测）
-      - images:      [B,C,H,W]（若有）
-      - span_starts / span_ends / span_types: [B, S_max]（-1 填充）
-      - span_mask:   [B, S_max]（1/0）
-      - span_counts: [B]      每条样本 span 数
-    """
-    has_image = ("image" in batch[0])
-
-    input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
-    attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
-    labels = torch.stack([b["labels"] for b in batch], dim=0)
-
-    if has_image:
-        images = torch.stack([b["image"] for b in batch], dim=0)
-
-    spans_list = [b["spans"] for b in batch]
-    counts = [len(s) for s in spans_list]
-    Smax = max(counts) if counts else 0
-    if Smax == 0:
-        Smax = 1  # 保底一列，避免下游维度为0
-
-    span_starts = torch.full((len(batch), Smax), -1, dtype=torch.long)
-    span_ends   = torch.full((len(batch), Smax), -1, dtype=torch.long)
-    span_types  = torch.full((len(batch), Smax), -1, dtype=torch.long)
-    span_mask   = torch.zeros((len(batch), Smax), dtype=torch.long)
-
-    for i, spans in enumerate(spans_list):
-        for j, (s,e,t) in enumerate(spans[:Smax]):
-            span_starts[i, j] = s
-            span_ends[i, j]   = e
-            span_types[i, j]  = t
-            span_mask[i, j]   = 1
-
-    out = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "span_starts": span_starts,
-        "span_ends": span_ends,
-        "span_types": span_types,
-        "span_mask": span_mask,
-        "span_counts": torch.tensor(counts, dtype=torch.long),
-    }
-    if has_image:
-        out["image"] = images
-    return out
 
 
 if __name__ == '__main__':

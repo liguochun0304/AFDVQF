@@ -18,7 +18,7 @@ from torchvision import transforms
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
-from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn, collate_fn_span
+from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
 from model import build_model
 from test import evaluate_model
 from test import load_config
@@ -113,13 +113,13 @@ def train(config):
     processor = MMPNERProcessor(data_path, config.text_encoder)
     train_dataset = MMPNERDataset(
         processor, transform, img_path=img_path, max_seq=config.max_len,
-        sample_ratio=1.0, mode='train', return_span=True
+        sample_ratio=1.0, mode='train'
     )
     train_loader = DataLoader(
         train_dataset, batch_size=64, shuffle=True,
         num_workers=0,       # 避免多进程占用 /dev/shm
         pin_memory=False,    # 关闭 pinned 内存以减轻内存压力
-        collate_fn=collate_fn_span
+        collate_fn=collate_fn
     )
 
     val_dataset = MMPNERDataset(
@@ -260,20 +260,11 @@ def train(config):
                 if images is not None:
                     images = images.to(device)
 
-                span_starts = batch["span_starts"].to(device)
-                span_ends = batch["span_ends"].to(device)
-                span_types = batch["span_types"].to(device)
-                span_mask = batch["span_mask"].to(device)
-
                 loss = model(
                     input_ids,
                     attention_mask,
                     image_tensor=images,
                     labels=labels,
-                    span_starts=span_starts,
-                    span_ends=span_ends,
-                    span_types=span_types,
-                    span_mask=span_mask,
                 )
 
                 loss = loss / config.gradient_accumulation_steps

@@ -19,59 +19,11 @@ from model import build_model
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 
-# ========= 工具：Span → BIO ids（专用版） =========
-def spans_to_bio_ids(seq_len, spans, label_mapping):
-    """
-    将 span 解码结果转换为 BIO id 序列
-    spans: [(s, e, type, score), ...]  e 为右开区间
-    """
-    # 动态从 label_mapping 中提取实体类型
-    tag_to_id = {tag: idx for tag, idx in label_mapping.items()}
-    # 从标签中提取实体类型（去掉 B- 和 I- 前缀）
-    entity_types = set()
-    for tag in tag_to_id.keys():
-        if tag.startswith('B-'):
-            entity_types.add(tag[2:])  # 去掉 'B-'
-        elif tag.startswith('I-'):
-            entity_types.add(tag[2:])  # 去掉 'I-'
-
-    # 创建类型 ID 到字符串的映射
-    TYPE_ID2STR = {}
-    type_str_to_id = {}
-    for i, entity_type in enumerate(sorted(entity_types)):
-        TYPE_ID2STR[i] = entity_type
-        type_str_to_id[entity_type] = i
-
-    bio = [label_mapping["O"]] * seq_len
-
-    def type_to_tags(tstr):
-        if tstr == "OTHER" or tstr == "MISC":
-            return "B-MISC", "I-MISC"
-        return "B-{0}".format(tstr), "I-{0}".format(tstr)
-
-    for span in spans:
-        s, e, t = span[0], span[1], span[2]
-        if isinstance(t, int):
-            tstr = TYPE_ID2STR.get(t, None)
-        else:
-            tstr = t
-        if tstr is None:
-            continue
-        if not (0 <= s < e <= seq_len):
-            continue
-        btag, itag = type_to_tags(tstr)
-        b_id = label_mapping.get(btag, label_mapping["O"])
-        i_id = label_mapping.get(itag, label_mapping["O"])
-        bio[s] = b_id
-        for i in range(s + 1, e):
-            bio[i] = i_id
-    return bio
-
-
 def evaluate_model(model, val_loader, device, tags):
     model.eval()
     all_preds, all_labels, all_words = [], [], []
     idx2tag = {v: k for k, v in tags.items()}
+    to_list = lambda x: x.tolist() if hasattr(x, "tolist") else list(x)
 
     with torch.no_grad():
         for batch in val_loader:
@@ -88,8 +40,8 @@ def evaluate_model(model, val_loader, device, tags):
             # ------- 对齐 metrics 输入 -------
             for p_ids, l_ids, mask in zip(preds, labels, attention_mask):
                 valid_len = int(mask.sum().item())
-                p_ids = p_ids[:valid_len].tolist()
-                l_ids = l_ids[:valid_len].tolist()
+                p_ids = to_list(p_ids[:valid_len])
+                l_ids = to_list(l_ids[:valid_len])
 
                 kept_pred, kept_gold = [], []
                 for pid, lid in zip(p_ids, l_ids):

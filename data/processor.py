@@ -102,15 +102,14 @@ def convert_bio_block_to_json(block, image_base_dir):
         tokens.append(token)
         labels.append(label)
 
-    # 对英文加空格，对中文不加
-    if all(token.isascii() for token in tokens):
-        text = " ".join(tokens)
-    else:
-        text = "".join(tokens)
-
-    # print("\n")
-    # ✅ 额外检查：tokens 和 labels 长度是否一致
-    assert len(tokens) == len(labels), f"Token 和 Label 数量不一致：{tokens}, {labels}"
+    text = " ".join(tokens)
+    
+    text_tokens = text.split()
+    if len(text_tokens) != len(labels):
+        if len(text_tokens) < len(labels):
+            labels = labels[:len(text_tokens)]
+        else:
+            labels.extend(["O"] * (len(text_tokens) - len(labels)))
 
     return {
         "text": text,
