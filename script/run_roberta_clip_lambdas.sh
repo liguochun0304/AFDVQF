@@ -257,3 +257,4 @@ echo
 echo "Failed runs:"
 cat "$FAIL_LIST" || true
 echo "Logs at: $LOG_DIR"
+/usr/bin/shutdown -h now

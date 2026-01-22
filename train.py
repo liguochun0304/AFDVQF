@@ -32,12 +32,14 @@ def set_seed(seed=42):
     random.seed(seed)  # Python 随机种子
     np.random.seed(seed)  # numpy 随机种子
     torch.manual_seed(seed)  # CPU torch 随机种子
-    torch.cuda.manual_seed(seed)  # GPU 随机种子
-    torch.cuda.manual_seed_all(seed)  # 多 GPU 情况
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)  # GPU 随机种子
+        torch.cuda.manual_seed_all(seed)  # 多 GPU 情况
 
     # 保证 CUDA 可复现（但可能会略微降低速度）
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     os.environ['PYTHONHASHSEED'] = str(seed)
 
@@ -57,9 +59,10 @@ def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, 
 
 
 def load_model_checkpoint(model, optimizer, scheduler, load_dir):
-    model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt")))
-    optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt")))
-    scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt")))
+    device = next(model.parameters()).device
+    model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt"), map_location=device))
+    optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt"), map_location=device))
+    scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt"), map_location=device))
 
     with open(os.path.join(load_dir, "training_state.json")) as f:
         state = json.load(f)
@@ -90,7 +93,13 @@ def train(config):
     os.makedirs(tb_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
 
-    device = torch.device(config.device)
+    dev = getattr(config, "device", "cuda:0")
+    if isinstance(dev, str) and (dev == "cuda" or dev.startswith("cuda")) and not torch.cuda.is_available():
+        dev = "cpu"
+    try:
+        device = torch.device(dev)
+    except Exception:
+        device = torch.device("cpu")
 
     DATA_PATH = {
         "twitter2015": {
@@ -128,12 +137,13 @@ def train(config):
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])])
     processor = MMPNERProcessor(data_path, config.text_encoder)
+    use_set_prediction = (getattr(config, "model", None) == "mqspn_set")
     train_dataset = MMPNERDataset(
         processor, transform, img_path=img_path, max_seq=config.max_len,
-        sample_ratio=1.0, mode='train'
+        sample_ratio=1.0, mode='train', set_prediction=use_set_prediction
     )
     train_loader = DataLoader(
-        train_dataset, batch_size=64, shuffle=True,
+        train_dataset, batch_size=config.batch_size, shuffle=True,
         num_workers=0,       # 避免多进程占用 /dev/shm
         pin_memory=False,    # 关闭 pinned 内存以减轻内存压力
         collate_fn=collate_fn
@@ -145,7 +155,8 @@ def train(config):
         img_path=img_path,
         max_seq=config.max_len,
         sample_ratio=1.0,
-        mode='valid'
+        mode='valid',
+        set_prediction=use_set_prediction
     )
 
     val_loader = DataLoader(
@@ -159,11 +170,17 @@ def train(config):
 
     config.num_labels = len(train_dataset.label_mapping)
 
+    tokenizer = None
+    type_names = None
+    if use_set_prediction:
+        tokenizer = processor.tokenizer
+        type_names = train_dataset.type_names
+
     start_epoch = 0
     best_f1 = 0.0
     if config.continue_train_name == "None":
         # 正常首次训练
-        model = build_model(config).to(device)
+        model = build_model(config, tokenizer=tokenizer, type_names=type_names).to(device)
     else:
         SAVE_ROOT = os.path.join(STORAGE_ROOT, "save_models")
         # 从 save_models/<name> 读取先前 config 以确保结构一致
@@ -171,7 +188,10 @@ def train(config):
         prev_cfg = load_config(config.continue_train_name)  # 你已有的函数
 
         # 用先前配置构建结构，但运行参数沿用当前命令行（比如新的 LR/drop/align 等）
-        model = build_model(prev_cfg).to(device)
+        prev_use_set_prediction = (getattr(prev_cfg, "model", None) == "mqspn_set")
+        prev_tokenizer = processor.tokenizer if prev_use_set_prediction else None
+        prev_type_names = train_dataset.type_names if prev_use_set_prediction else None
+        model = build_model(prev_cfg, tokenizer=prev_tokenizer, type_names=prev_type_names).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
@@ -247,9 +267,9 @@ def train(config):
     # =============== 加载 checkpoint（模型权重 / 或完整状态） ===============
     if config.continue_train_name != "None":
         load_dir = ckpt_dir
-        model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt")))
-        optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt")))
-        scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt")))
+        model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt"), map_location=device))
+        optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt"), map_location=device))
+        scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt"), map_location=device))
 
         with open(os.path.join(load_dir, "training_state.json")) as f:
             state = json.load(f)
@@ -277,12 +297,21 @@ def train(config):
                 if images is not None:
                     images = images.to(device)
 
-                loss = model(
-                    input_ids,
-                    attention_mask,
-                    image_tensor=images,
-                    labels=labels,
-                )
+                if use_set_prediction:
+                    targets = batch.get("targets", None)
+                    loss = model(
+                        input_ids,
+                        attention_mask,
+                        image_tensor=images,
+                        targets=targets,
+                    )
+                else:
+                    loss = model(
+                        input_ids,
+                        attention_mask,
+                        image_tensor=images,
+                        labels=labels,
+                    )
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -316,7 +345,12 @@ def train(config):
             print("\n✅ Epoch {0} Train Loss: {1:.4f}".format(epoch, avg_loss))
 
         # f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
-            acc, f1, p, r = evaluate_model(model, val_loader, device, train_dataset.label_mapping)
+            acc, f1, p, r = evaluate_model(
+                model, val_loader, device, train_dataset.label_mapping,
+                is_set_prediction=use_set_prediction,
+                type_names=type_names,
+                label_mapping=train_dataset.label_mapping
+            )
             print(
                 "🎯Epoch {0} Eval F1: {1:.4f} precision: {2:.4f} recall: {3:.4f} acc:{4:.4f}".format(epoch, f1, p, r, acc))
             writer.add_scalar("eval/f1", f1, epoch)

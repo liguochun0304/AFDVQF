@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 
 from metrics import evaluate_each_class, evaluate
-from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
+from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn, spans_to_bio
 from model import build_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,8 +21,8 @@ STORAGE_ROOT = "/root/autodl-fs"
 DATA_ROOT = os.path.join(STORAGE_ROOT, "data")
 
 
-def evaluate_model(model, val_loader, device, tags):
-    print(f"[evaluate] 进入评估模式, batch数量: {len(val_loader)}")
+def evaluate_model(model, val_loader, device, tags, is_set_prediction=False, type_names=None, label_mapping=None):
+    print(f"[evaluate] 进入评估模式, batch数量: {len(val_loader)}, set_prediction={is_set_prediction}")
     model.eval()
     all_preds, all_labels, all_words = [], [], []
     idx2tag = {v: k for k, v in tags.items()}
@@ -41,26 +41,44 @@ def evaluate_model(model, val_loader, device, tags):
             if images is not None:
                 images = images.to(device)
 
-            # 直接使用模型的 token-level 预测输出
             preds = model(input_ids=input_ids, attention_mask=attention_mask, image_tensor=images)
 
-            # ------- 对齐 metrics 输入 -------
-            for p_ids, l_ids, mask in zip(preds, labels, attention_mask):
-                valid_len = int(mask.sum().item())
-                p_ids = to_list(p_ids[:valid_len])
-                l_ids = to_list(l_ids[:valid_len])
+            if is_set_prediction:
+                for pred_spans, l_ids, mask in zip(preds, labels, attention_mask):
+                    valid_len = int(mask.sum().item())
+                    seq_len = len(l_ids)
+                    p_ids = spans_to_bio(pred_spans, seq_len, type_names, label_mapping, ignore_special=True)
+                    l_ids = to_list(l_ids[:valid_len])
+                    p_ids = p_ids[:valid_len]
 
-                kept_pred, kept_gold = [], []
-                for pid, lid in zip(p_ids, l_ids):
-                    tag_name = idx2tag.get(lid, "O")
-                    if tag_name in ("[CLS]", "[SEP]", "X"):
-                        continue
-                    kept_pred.append(pid)
-                    kept_gold.append(lid)
+                    kept_pred, kept_gold = [], []
+                    for pid, lid in zip(p_ids, l_ids):
+                        tag_name = idx2tag.get(lid, "O")
+                        if tag_name in ("[CLS]", "[SEP]", "X"):
+                            continue
+                        kept_pred.append(pid)
+                        kept_gold.append(lid)
 
-                all_preds.append(kept_pred)
-                all_labels.append(kept_gold)
-                all_words.append([])
+                    all_preds.append(kept_pred)
+                    all_labels.append(kept_gold)
+                    all_words.append([])
+            else:
+                for p_ids, l_ids, mask in zip(preds, labels, attention_mask):
+                    valid_len = int(mask.sum().item())
+                    p_ids = to_list(p_ids[:valid_len])
+                    l_ids = to_list(l_ids[:valid_len])
+
+                    kept_pred, kept_gold = [], []
+                    for pid, lid in zip(p_ids, l_ids):
+                        tag_name = idx2tag.get(lid, "O")
+                        if tag_name in ("[CLS]", "[SEP]", "X"):
+                            continue
+                        kept_pred.append(pid)
+                        kept_gold.append(lid)
+
+                    all_preds.append(kept_pred)
+                    all_labels.append(kept_gold)
+                    all_words.append([])
 
     print(f"[evaluate] 完成预测, 样本数: {len(all_preds)}")
     # 总体指标
@@ -130,12 +148,13 @@ def main():
     print(f"[test] 初始化processor: text_encoder={config.text_encoder}")
     processor = MMPNERProcessor(data_path, config.text_encoder)
 
+    use_set_prediction = (getattr(config, "model", None) == "mqspn_set")
     # 测试集
     print(f"[test] 创建测试数据集: dataset={config.dataset_name}, max_len={config.max_len}")
     test_dataset = MMPNERDataset(
         processor, transform,
         img_path=img_path, max_seq=config.max_len,
-        sample_ratio=1.0, mode='test'
+        sample_ratio=1.0, mode='test', set_prediction=use_set_prediction
     )
 
     test_loader = DataLoader(
@@ -147,9 +166,15 @@ def main():
         collate_fn=collate_fn
     )
 
+    tokenizer = None
+    type_names = None
+    if use_set_prediction:
+        tokenizer = processor.tokenizer
+        type_names = test_dataset.type_names
+
     # 模型
     print(f"[test] 构建模型: {config.model}")
-    model = build_model(config).to(device)
+    model = build_model(config, tokenizer=tokenizer, type_names=type_names).to(device)
     model_path = os.path.join(STORAGE_ROOT, "save_models", args.save_name, "model.pt")
     print(f"[test] 加载模型权重: {model_path}")
     state = torch.load(model_path, map_location=device)
@@ -158,7 +183,12 @@ def main():
 
     # 评估
     print("[test] 开始评估")
-    acc, f1, p, r = evaluate_model(model, test_loader, device, test_dataset.label_mapping)
+    acc, f1, p, r = evaluate_model(
+        model, test_loader, device, test_dataset.label_mapping,
+        is_set_prediction=use_set_prediction,
+        type_names=type_names,
+        label_mapping=test_dataset.label_mapping
+    )
     print("[Overall] Acc={0:.4f}, P={1:.4f}, R={2:.4f}, F1={3:.4f}".format(acc, p, r, f1))
 
 

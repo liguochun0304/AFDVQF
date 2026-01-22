@@ -19,11 +19,90 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from transformers import BertTokenizer
 from transformers import RobertaTokenizer, CLIPProcessor
-from model import _resolve_path
+from model import _resolve_path, EntityTarget
 
 
 
 logger = logging.getLogger(__name__)
+
+
+def bio_to_spans(label_ids: List[int], id2tag: Dict[int, str], type_name2id: Dict[str, int]) -> List[EntityTarget]:
+    spans = []
+    i = 0
+    while i < len(label_ids):
+        tag = id2tag.get(label_ids[i], "O")
+        if tag.startswith("B-"):
+            etype = tag[2:]
+            start = i
+            end = i
+            i += 1
+            while i < len(label_ids):
+                next_tag = id2tag.get(label_ids[i], "O")
+                if next_tag == f"I-{etype}":
+                    end = i
+                    i += 1
+                else:
+                    break
+            if etype in type_name2id:
+                spans.append(EntityTarget(start=start, end=end, type_id=type_name2id[etype], region_id=-1))
+        else:
+            i += 1
+    return spans
+
+
+def get_entity_type_names(label_mapping: Dict[str, int]) -> List[str]:
+    types = set()
+    for lab in label_mapping:
+        if lab.startswith("B-"):
+            types.add(lab[2:])
+    return sorted(types)
+
+
+def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str], label_mapping: Dict[str, int], ignore_special: bool = True) -> List[int]:
+    """
+    将实体列表转换回 BIO 序列
+    Args:
+        spans: 实体列表，每个实体包含 (start, end, type_id, region_id)
+        seq_len: 序列长度（包含 [CLS] 和 [SEP]）
+        type_names: 实体类型名称列表
+        label_mapping: 标签到 ID 的映射
+        ignore_special: 是否忽略 [CLS] 和 [SEP] 位置（默认 True，即从位置 1 开始）
+    Returns:
+        BIO 标签序列（List[int]）
+    """
+    bio_seq = [label_mapping.get("O", 0)] * seq_len
+    
+    for span in spans:
+        start, end = span.start, span.end
+        type_id = span.type_id
+        
+        if type_id < 0 or type_id >= len(type_names):
+            continue
+        
+        type_name = type_names[type_id]
+        b_tag = f"B-{type_name}"
+        i_tag = f"I-{type_name}"
+        
+        b_id = label_mapping.get(b_tag)
+        i_id = label_mapping.get(i_tag)
+        
+        if b_id is None or i_id is None:
+            continue
+        
+        if ignore_special:
+            if start < 1 or end < 1 or start >= seq_len - 1 or end >= seq_len - 1:
+                continue
+        else:
+            if start < 0 or end < 0 or start >= seq_len or end >= seq_len:
+                continue
+        
+        if start <= end:
+            bio_seq[start] = b_id
+            for i in range(start + 1, end + 1):
+                if i < seq_len:
+                    bio_seq[i] = i_id
+    
+    return bio_seq
 
 class MMPNERProcessor(object):
     def __init__(self, data_path, bert_name):
@@ -169,7 +248,7 @@ class MMPNERProcessor(object):
 
 class MMPNERDataset(Dataset):
     def __init__(self, processor, transform, img_path=None, max_seq=40, sample_ratio=1, mode='train',
-                 ignore_idx=0):
+                 ignore_idx=0, set_prediction=False):
         self.processor = processor
         self.transform = transform
         self.data_dict = processor.load_from_file(mode, sample_ratio)
@@ -182,6 +261,9 @@ class MMPNERDataset(Dataset):
         self.mode = mode
         self.sample_ratio = sample_ratio
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.set_prediction = set_prediction
+        self.type_names = get_entity_type_names(self.label_mapping)
+        self.type_name2id = {t: i for i, t in enumerate(self.type_names)}
 
         # 常用 id
         self.cls_id = self.label_mapping.get("[CLS]")
@@ -223,12 +305,17 @@ class MMPNERDataset(Dataset):
         input_ids = torch.tensor(encode_dict['input_ids'], dtype=torch.long)
         attention_mask = torch.tensor(encode_dict['attention_mask'], dtype=torch.long)
 
-        # 你原先的 token 标签（保持原接口）
         labels = [self.label_mapping["[CLS]"]] + labels_exp + [self.label_mapping["[SEP]"]] \
                  + [self.ignore_idx] * (self.max_seq - len(labels_exp) - 2)
         labels = torch.tensor(labels, dtype=torch.long)
 
-        # 图像读取（保持原逻辑）
+        if self.set_prediction:
+            label_ids_list = labels.tolist()
+            targets = bio_to_spans(label_ids_list, self.id2tag, self.type_name2id)
+            for t in targets:
+                t.start += 1
+                t.end += 1
+
         if self.img_path is not None:
             try:
                 img_path = os.path.join(self.img_path, img)
@@ -237,27 +324,25 @@ class MMPNERDataset(Dataset):
             except:
                 img_path = os.path.join("/root/autodl-fs", "data", "no_images.jpg")
                 if not os.path.exists(img_path):
-                img_path = os.path.join(self.script_dir, 'data', 'no_images.jpg')
+                    img_path = os.path.join(self.script_dir, 'data', 'no_images.jpg')
                 image = Image.open(img_path).convert('RGB')
                 image = self.transform(image)
 
+            if self.set_prediction:
+                return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "image": image, "targets": targets}
             return input_ids, attention_mask, labels, image
 
-        # 无图像分支（保持原接口）
-        assert len(input_ids) == len(attention_mask) == len(labels)
+        if self.set_prediction:
+            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "targets": targets}
         return input_ids, attention_mask, labels
 
 def collate_fn(batch):
-    """
-    batch: List[tuple] 或 List[dict]
-    """
     if isinstance(batch[0], dict):
-        # 字典格式
         has_image = "image" in batch[0]
+        has_targets = "targets" in batch[0]
         input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
         attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
         labels = torch.stack([b["labels"] for b in batch], dim=0)
-
         out = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -266,9 +351,10 @@ def collate_fn(batch):
         if has_image:
             images = torch.stack([b["image"] for b in batch], dim=0)
             out["image"] = images
+        if has_targets:
+            out["targets"] = [b["targets"] for b in batch]
         return out
     else:
-        # 元组格式: (input_ids, attention_mask, labels) 或 (input_ids, attention_mask, labels, image)
         if len(batch[0]) == 3:
             input_ids, attention_mask, labels = zip(*batch)
             has_image = False
@@ -277,11 +363,9 @@ def collate_fn(batch):
             has_image = True
         else:
             raise ValueError("Unexpected batch format")
-
         input_ids = torch.stack(input_ids, dim=0)
         attention_mask = torch.stack(attention_mask, dim=0)
         labels = torch.stack(labels, dim=0)
-
         out = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,

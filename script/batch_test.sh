@@ -119,6 +119,7 @@ echo
 echo "======== 全部完成 ========"
 echo "汇总表：$SUMMARY_CSV"
 echo "日志目录：$LOG_DIR"
+/usr/bin/shutdown -h now
 
 
 

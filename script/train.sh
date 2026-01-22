@@ -1,3 +1,8 @@
+STAMP=$(date +%F_%H%M%S)
+LOG_DIR="../logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/train_${STAMP}.log"
+
 python3 ../train.py \
   --device "cuda:0" \
   --epochs 50 \
@@ -24,4 +29,7 @@ python3 ../train.py \
   --num_interaction_layers 4 \
   --num_queries 8 \
   --use_dynamic_routing \
-  --vision_trainable
+  --vision_trainable |& tee -a "$LOG_FILE"
+rc=${PIPESTATUS[0]}
+/usr/bin/shutdown -h now
+exit $rc
