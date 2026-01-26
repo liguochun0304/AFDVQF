@@ -87,7 +87,7 @@ def train(config):
             if not os.path.exists(save_dir):
                 break
             idx += 1
-    tb_dir = os.path.join(STORAGE_ROOT, "tf-logs", run_name)
+    tb_dir = os.path.join("/root/tf-logs", run_name)
     os.makedirs(tb_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
 

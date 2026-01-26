@@ -317,9 +317,6 @@ class MMPNERDataset(Dataset):
         if self.set_prediction:
             label_ids_list = labels.tolist()
             targets = bio_to_spans(label_ids_list, self.id2tag, self.type_name2id)
-            for t in targets:
-                t.start += 1
-                t.end += 1
 
         if self.img_path is not None:
             try:
@@ -385,24 +382,27 @@ def collate_fn(batch):
 if __name__ == '__main__':
     device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
 
+    STORAGE_ROOT = "/root/autodl-fs"
+    DATA_ROOT = os.path.join(STORAGE_ROOT, "data")
+
     DATA_PATH = {
         "twitter2015": {
             # text data
-            'train': 'data/twitter2015/train.txt',
-            'valid': 'data/twitter2015/valid.txt',
-            'test': 'data/twitter2015/test.txt',
+            'train': os.path.join(DATA_ROOT, 'twitter2015/train.txt'),
+            'valid': os.path.join(DATA_ROOT, 'twitter2015/valid.txt'),
+            'test':  os.path.join(DATA_ROOT, 'twitter2015/test.txt'),
         },
         "twitter2017": {
             # text data
-            'train': 'data/twitter2017/train.txt',
-            'valid': 'data/twitter2017/valid.txt',
-            'test': 'data/twitter2017/test.txt',
+            'train': os.path.join(DATA_ROOT, 'twitter2017/train.txt'),
+            'valid': os.path.join(DATA_ROOT, 'twitter2017/valid.txt'),
+            'test':  os.path.join(DATA_ROOT, 'twitter2017/test.txt'),
         }
     }
     # image data
     IMG_PATH = {
-        'twitter15': 'data/twitter2015/twitter2015_images',
-        'twitter17': 'data/twitter2017/twitter2017_images',
+        'twitter15': os.path.join(DATA_ROOT, 'twitter2015/twitter2015_images'),
+        'twitter17': os.path.join(DATA_ROOT, 'twitter2017/twitter2017_images'),
     }
 
     transform = transforms.Compose([
@@ -413,13 +413,33 @@ if __name__ == '__main__':
                              std=[0.229, 0.224, 0.225])])
     data_path = DATA_PATH['twitter2015']
     img_path = IMG_PATH['twitter15']
-    processor = MMPNERProcessor(data_path, "chinese-roberta-www-ext")
+    processor = MMPNERProcessor(data_path, "bert")
     train_dataset = MMPNERDataset(processor, transform, img_path=img_path, max_seq=128,
-                                  sample_ratio=1.0, mode='train')
-    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=1, pin_memory=True)
+                                  sample_ratio=1.0, mode='train', set_prediction=True)
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=2,
+        shuffle=True,
+        num_workers=1,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
 
-    for batch in train_dataloader:
-        input_ids, token_type_ids, attention_mask, labels, image = batch
+    batch = next(iter(train_dataloader))
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    labels = batch["labels"]
+    targets = batch.get("targets", [])
 
-        print(input_ids.shape, token_type_ids.shape, attention_mask.shape, labels.shape)
-        break
+    id2tag = train_dataset.id2tag
+    for b in range(input_ids.size(0)):
+        valid_len = int(attention_mask[b].sum().item())
+        ids = input_ids[b, :valid_len].tolist()
+        toks = train_dataset.tokenizer.convert_ids_to_tokens(ids)
+        labs = labels[b, :valid_len].tolist()
+        lab_str = [id2tag.get(x, str(x)) for x in labs]
+        spans = [(t.start, t.end, train_dataset.type_names[t.type_id]) for t in (targets[b] if b < len(targets) else [])]
+        print("tokens:", toks)
+        print("labels:", lab_str)
+        print("spans:", spans)
+        print("-" * 60)

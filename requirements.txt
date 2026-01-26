@@ -5,3 +5,4 @@ TorchCRF==1.1.0
 torchelastic==0.2.2
 torchvision==0.22.1
 transformers==4.53.2
+scipy

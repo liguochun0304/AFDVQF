@@ -293,19 +293,6 @@ class MQSPNSetNER(BaseNERModel):
             exist_target_all[b, idx_q] = 1.0
             matched_count += len(idx_q)
             
-            if b == 0:
-                print("gold entities:", [(g.start, g.end, g.type_id) for g in gold])
-                print("matched queries:", idx_q.tolist())
-                print("matched gold idx:", idx_m.tolist())
-                print("matched query types:", q_type_ids[idx_q].tolist())
-                for qi, mi in zip(idx_q.tolist(), idx_m.tolist()):
-                    ps = start_logits[b, qi].argmax().item()
-                    pe = end_logits[b, qi].argmax().item()
-                    print("gold span:", gold_start[mi].item(), gold_end[mi].item(),
-                          "pred span:", ps, pe)
-                print("exist_target sum:", exist_target_all[b].sum().item(),
-                      "total queries:", exist_target_all[b].numel())
-            
             loss_span = loss_span + F.cross_entropy(start_logits[b, idx_q], gold_start[idx_m]) + F.cross_entropy(end_logits[b, idx_q], gold_end[idx_m])
             gm = gold_reg[idx_m]
             ok = (gm >= 0)
@@ -328,8 +315,6 @@ class MQSPNSetNER(BaseNERModel):
                 if pos_mask.any():
                     pos_prob = prob[pos_mask]
                     neg_prob = prob[~pos_mask]
-                    print("exist prob pos mean:", pos_prob.mean().item())
-                    print("exist prob neg mean:", neg_prob.mean().item())
         
         if matched_count > 0:
             return self.loss_w_span * loss_span / matched_count + self.loss_w_region * loss_region / matched_count + self.loss_w_exist * loss_exist
