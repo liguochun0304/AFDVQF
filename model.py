@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
-import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchcrf import CRF
 from transformers import CLIPModel, RobertaModel, BertModel
 
 try:
@@ -14,9 +12,6 @@ try:
     _HAS_SCIPY = True
 except Exception:
     _HAS_SCIPY = False
-
-MODEL_REGISTRY = {}
-
 
 @dataclass
 class EntityTarget:
@@ -26,24 +21,10 @@ class EntityTarget:
     region_id: int = -1
 
 
-def register_model(name):
-    def deco(cls_or_fn):
-        if name in MODEL_REGISTRY:
-            raise ValueError("Duplicate model name: {0}".format(name))
-        MODEL_REGISTRY[name] = cls_or_fn
-        return cls_or_fn
-    return deco
-
-
 def build_model(config, tokenizer=None, type_names=None):
-    name = getattr(config, "model", None)
-    if not name:
-        raise KeyError("config.model 未设置")
-    if name not in MODEL_REGISTRY:
-        raise KeyError("未知模型 '{0}'，可选：{1}".format(name, list(MODEL_REGISTRY.keys())))
-    if name == "mqspn_set":
-        return MODEL_REGISTRY[name](config, tokenizer=tokenizer, type_names=type_names)
-    return MODEL_REGISTRY[name](config)
+    if tokenizer is None or type_names is None:
+        raise ValueError("tokenizer 和 type_names 必须提供")
+    return MQSPNSetNER(config, tokenizer=tokenizer, type_names=type_names)
 
 
 class BaseNERModel(nn.Module):
@@ -66,375 +47,6 @@ def _resolve_path(script_dir, path):
         if os.path.exists(cand):
             return cand
     return None
-
-
-# ==================== RPI-HMIF 核心模块 ====================
-
-class QuestionGuidedMining(nn.Module):
-    """
-    借鉴 RPI-HMIF 的 HIM：用可学习的 query 作为"显式问题"
-    引导模型从文本/视觉中挖掘 task-relevant 的核心特征
-    """
-    def __init__(self, hidden_dim, num_queries=8, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.queries = nn.Parameter(torch.randn(num_queries, hidden_dim) * 0.02)
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-        )
-
-    def forward(self, features, mask=None):
-        B = features.shape[0]
-        queries = self.queries.unsqueeze(0).expand(B, -1, -1)
-        key_padding_mask = (mask == 0) if mask is not None else None
-        mined, _ = self.cross_attn(queries, features, features, key_padding_mask=key_padding_mask)
-        mined = self.norm(mined + self.ffn(mined))
-        return mined
-
-
-class DynamicRoutingFusion(nn.Module):
-    """
-    借鉴 RPI-HMIF 的 IFFE：动态路由迭代融合
-    通过多轮 routing 迭代优化模态交互权重
-    """
-    def __init__(self, hidden_dim, num_iterations=3, dropout=0.1):
-        super().__init__()
-        self.num_iterations = num_iterations
-        self.text_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.vision_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.Sigmoid()
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, text_feat, vision_feat):
-        B, L, H = text_feat.shape
-        vision_pooled = vision_feat.mean(dim=1, keepdim=True).expand(-1, L, -1)
-
-        text_proj = self.text_proj(text_feat)
-        vision_proj = self.vision_proj(vision_pooled)
-
-        coupling = torch.zeros(B, L, 1, device=text_feat.device)
-
-        for _ in range(self.num_iterations):
-            routing_weights = F.softmax(coupling, dim=1)
-            weighted_vision = routing_weights * vision_proj
-
-            gate_input = torch.cat([text_proj, weighted_vision], dim=-1)
-            gate = self.gate(gate_input)
-
-            fused = text_feat + gate * weighted_vision
-
-            agreement = (text_proj * vision_proj).sum(dim=-1, keepdim=True)
-            coupling = coupling + agreement
-
-        return self.norm(self.dropout(fused))
-
-
-class CorrelationAwareModule(nn.Module):
-    """借鉴 VEC-MNER：动态调整视觉特征贡献"""
-    def __init__(self, hidden_dim, reduction=16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
-        self.max_pool = nn.AdaptiveMaxPool1d(1)
-        self.excitation = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // reduction),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // reduction, hidden_dim),
-        )
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x):
-        B, N, H = x.shape
-        x_t = x.transpose(1, 2)
-        x_avg = self.avg_pool(x_t).squeeze(-1)
-        x_max = self.max_pool(x_t).squeeze(-1)
-        weight = self.excitation(x_avg + x_max)
-        weight = self.softmax(weight).unsqueeze(1)
-        return x * weight
-
-
-class CrossModalInteraction(nn.Module):
-    """跨模态交互：Q=text, K/V=vision"""
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, query, context):
-        out, _ = self.attn(query, context, context)
-        return self.norm(query + out)
-
-
-class HybridEncoderLayer(nn.Module):
-    """融合 VEC-MNER + RPI-HMIF：层级交互 + 动态路由"""
-    def __init__(self, hidden_dim, num_heads=8, dropout=0.1, use_dynamic_routing=True):
-        super().__init__()
-        self.use_dynamic_routing = use_dynamic_routing
-        self.text_self_attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
-        self.ca_module = CorrelationAwareModule(hidden_dim)
-        self.cross_modal = CrossModalInteraction(hidden_dim, num_heads, dropout)
-
-        if use_dynamic_routing:
-            self.dynamic_routing = DynamicRoutingFusion(hidden_dim, num_iterations=3, dropout=dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.Dropout(dropout),
-        )
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-
-    def forward(self, text_feat, vision_feat, text_mask=None):
-        text_feat2 = self.norm1(text_feat)
-        text_feat2, _ = self.text_self_attn(
-            text_feat2, text_feat2, text_feat2,
-            key_padding_mask=(text_mask == 0) if text_mask is not None else None
-        )
-        text_feat = text_feat + text_feat2
-
-        vision_aware = self.ca_module(vision_feat)
-        text_feat = self.cross_modal(text_feat, vision_aware)
-
-        if self.use_dynamic_routing:
-            text_feat = self.dynamic_routing(text_feat, vision_aware)
-
-        text_feat2 = self.norm2(text_feat)
-        text_feat = text_feat + self.ffn(text_feat2)
-        return text_feat
-
-
-def cal_clip_loss(image_features, text_features, logit_scale):
-    image_features = F.normalize(image_features, dim=-1)
-    text_features = F.normalize(text_features, dim=-1)
-    logits_per_image = logit_scale * image_features @ text_features.t()
-    logits_per_text = logits_per_image.t()
-    labels = torch.arange(logits_per_image.shape[0], device=image_features.device)
-    loss = (F.cross_entropy(logits_per_image, labels) + F.cross_entropy(logits_per_text, labels)) / 2
-    return loss
-
-
-@register_model("MNER")
-class MultimodalNER(BaseNERModel):
-    """
-    融合 VEC-MNER + RPI-HMIF 的多模态 NER 模型：
-    1. BERT/RoBERTa 文本编码 + CLIP 视觉编码
-    2. QuestionGuidedMining (HIM)：显式问题引导挖掘核心特征
-    3. HybridEncoder + DynamicRoutingFusion (IFFE)：迭代融合
-    4. CorrelationAware：动态调整视觉贡献
-    5. CRF 解码 + CLIP 对比损失
-    """
-    def __init__(self, config):
-        super(MultimodalNER, self).__init__(config)
-        self.num_labels = config.num_labels
-        self.use_image = config.use_image
-        self.dropout_rate = config.drop_prob
-        self.contrastive_lambda = getattr(config, "contrastive_lambda", 0.1)
-        self.num_interaction_layers = getattr(config, "num_interaction_layers", 4)
-        self.num_queries = getattr(config, "num_queries", 8)
-        self.use_dynamic_routing = getattr(config, "use_dynamic_routing", True)
-        self.vision_trainable = getattr(config, "vision_trainable", False)
-        self.unfreeze_last_vision_blocks = int(getattr(config, "unfreeze_last_vision_blocks", 0) or 0)
-        self.image_dropout_p = float(getattr(config, "image_dropout_p", 0.0) or 0.0)
-        self.emission_temperature = float(getattr(config, "emission_temperature", 1.0) or 1.0)
-
-        t_path = _resolve_path(self.script_dir, config.text_encoder)
-        if "roberta" in config.text_encoder:
-            self.text_encoder = RobertaModel.from_pretrained(t_path, local_files_only=True)
-        else:
-            self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
-        self.hidden_dim = self.text_encoder.config.hidden_size
-
-        if self.use_image:
-            v_path = _resolve_path(self.script_dir, config.image_encoder)
-            self.clip = CLIPModel.from_pretrained(v_path, local_files_only=True)
-            for param in self.clip.parameters():
-                param.requires_grad = False
-            if self.vision_trainable:
-                try:
-                    layers = self.clip.vision_model.encoder.layers
-                    n = min(self.unfreeze_last_vision_blocks, len(layers)) if self.unfreeze_last_vision_blocks > 0 else 0
-                    if n > 0:
-                        for layer in layers[-n:]:
-                            for p in layer.parameters():
-                                p.requires_grad = True
-                    for p in self.clip.vision_model.post_layernorm.parameters():
-                        p.requires_grad = True
-                except Exception:
-                    for p in self.clip.vision_model.parameters():
-                        p.requires_grad = True
-            vision_dim = self.clip.vision_model.config.hidden_size
-
-            self.vision_proj = nn.Sequential(
-                nn.Linear(vision_dim, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-            )
-
-            self.text_mining = QuestionGuidedMining(
-                self.hidden_dim, num_queries=self.num_queries, num_heads=8, dropout=self.dropout_rate
-            )
-            self.vision_mining = QuestionGuidedMining(
-                self.hidden_dim, num_queries=self.num_queries, num_heads=8, dropout=self.dropout_rate
-            )
-
-            self.interaction_layers = nn.ModuleList([
-                HybridEncoderLayer(
-                    self.hidden_dim, num_heads=8, dropout=self.dropout_rate,
-                    use_dynamic_routing=self.use_dynamic_routing
-                )
-                for _ in range(self.num_interaction_layers)
-            ])
-
-            self.mined_fusion = nn.Sequential(
-                nn.Linear(self.hidden_dim * 2, self.hidden_dim),
-                nn.LayerNorm(self.hidden_dim),
-                nn.GELU(),
-            )
-
-            self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
-
-        self.dropout = nn.Dropout(self.dropout_rate)
-        self.classifier = nn.Linear(self.hidden_dim, self.num_labels)
-        self.crf = CRF(self.num_labels, batch_first=True)
-
-    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        text_output = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-        text_feat = text_output.last_hidden_state
-
-        contrastive_loss = torch.tensor(0.0, device=text_feat.device)
-
-        if self.use_image and image_tensor is not None:
-            if self.training and self.image_dropout_p > 0:
-                if torch.rand((), device=text_feat.device).item() < self.image_dropout_p:
-                    image_tensor = None
-            if image_tensor is not None:
-                ctx = torch.enable_grad() if (self.training and self.vision_trainable) else torch.no_grad()
-                with ctx:
-                    vision_output = self.clip.vision_model(pixel_values=image_tensor)
-                vision_patches = vision_output.last_hidden_state[:, 1:, :]
-                vision_feat = self.vision_proj(vision_patches)
-
-                text_core = self.text_mining(text_feat, mask=attention_mask)
-                vision_core = self.vision_mining(vision_feat, mask=None)
-
-                core_fused = self.mined_fusion(torch.cat([
-                    text_core.mean(dim=1, keepdim=True).expand(-1, text_feat.size(1), -1),
-                    vision_core.mean(dim=1, keepdim=True).expand(-1, text_feat.size(1), -1),
-                ], dim=-1))
-                text_feat = text_feat + core_fused
-
-                for layer in self.interaction_layers:
-                    text_feat = layer(text_feat, vision_feat, text_mask=attention_mask)
-
-                if self.training and self.contrastive_lambda > 0:
-                    text_pooled = (text_feat * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True)
-                    vision_pooled = vision_feat.mean(dim=1)
-                    contrastive_loss = cal_clip_loss(vision_pooled, text_pooled, self.logit_scale.exp())
-
-        emissions = self.classifier(self.dropout(text_feat))
-        if self.emission_temperature and self.emission_temperature != 1.0:
-            emissions = emissions / self.emission_temperature
-        mask = attention_mask.bool()
-
-        if labels is not None:
-            crf_loss = -self.crf(emissions, labels, mask=mask, reduction='mean')
-            total_loss = crf_loss + self.contrastive_lambda * contrastive_loss
-            return total_loss
-        return self.crf.decode(emissions, mask=mask)
-
-
-@register_model("roberta_crf")
-class RobertaCRF(BaseNERModel):
-    def __init__(self, config):
-        super(RobertaCRF, self).__init__(config)
-        self.num_labels = config.num_labels
-        t_path = _resolve_path(self.script_dir, config.text_encoder)
-        self.text_encoder = RobertaModel.from_pretrained(t_path, local_files_only=True)
-        H = self.text_encoder.config.hidden_size
-        self.dropout = nn.Dropout(config.drop_prob)
-        self.classifier = nn.Linear(H, self.num_labels)
-        self.crf = CRF(self.num_labels, batch_first=True)
-
-    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        txt = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        logits = self.classifier(self.dropout(txt))
-        mask = attention_mask.bool()
-        if labels is not None:
-            return -self.crf(logits, labels, mask=mask, reduction="mean")
-        return self.crf.decode(logits, mask=mask)
-
-
-@register_model("bert")
-class BERTOnly(BaseNERModel):
-    def __init__(self, config):
-        super(BERTOnly, self).__init__(config)
-        self.num_labels = config.num_labels
-        t_path = _resolve_path(self.script_dir, config.text_encoder)
-        self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
-        H = self.text_encoder.config.hidden_size
-        self.dropout = nn.Dropout(config.drop_prob)
-        self.classifier = nn.Linear(H, self.num_labels)
-
-    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        x = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        logits = self.classifier(self.dropout(x))
-        if labels is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100)
-        return logits.argmax(-1)
-
-
-@register_model("bert_crf")
-class BERTCRF(BaseNERModel):
-    def __init__(self, config):
-        super(BERTCRF, self).__init__(config)
-        self.num_labels = config.num_labels
-        t_path = _resolve_path(self.script_dir, config.text_encoder)
-        self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
-        H = self.text_encoder.config.hidden_size
-        self.dropout = nn.Dropout(config.drop_prob)
-        self.classifier = nn.Linear(H, self.num_labels)
-        self.crf = CRF(self.num_labels, batch_first=True)
-
-    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        x = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        logits = self.classifier(self.dropout(x))
-        mask = attention_mask.bool()
-        if labels is not None:
-            return -self.crf(logits, labels, mask=mask, reduction="mean")
-        return self.crf.decode(logits, mask=mask)
-
-
-@register_model("bert_bilstm_crf")
-class BERTBiLSTMCRF(BaseNERModel):
-    def __init__(self, config):
-        super(BERTBiLSTMCRF, self).__init__(config)
-        self.num_labels = config.num_labels
-        self.hidden_dim = config.hidden_dim
-        t_path = _resolve_path(self.script_dir, config.text_encoder)
-        self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
-        H = self.text_encoder.config.hidden_size
-        self.bilstm = nn.LSTM(H, self.hidden_dim // 2, num_layers=1, batch_first=True, bidirectional=True)
-        self.dropout = nn.Dropout(config.drop_prob)
-        self.classifier = nn.Linear(self.hidden_dim, self.num_labels)
-        self.crf = CRF(self.num_labels, batch_first=True)
-
-    def forward(self, input_ids, attention_mask, image_tensor=None, labels=None):
-        x = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        x, _ = self.bilstm(x)
-        logits = self.classifier(self.dropout(x))
-        mask = attention_mask.bool()
-        if labels is not None:
-            return -self.crf(logits, labels, mask=mask, reduction="mean")
-        return self.crf.decode(logits, mask=mask)
 
 
 def hungarian_match(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -571,7 +183,6 @@ class ExistenceHead(nn.Module):
         return self.mlp(x).squeeze(-1)
 
 
-@register_model("mqspn_set")
 class MQSPNSetNER(BaseNERModel):
     def __init__(self, config, tokenizer=None, type_names=None):
         super().__init__(config)
@@ -621,7 +232,7 @@ class MQSPNSetNER(BaseNERModel):
         region_mask = torch.ones(region_feat.size()[:2], device=region_feat.device, dtype=torch.long)
         return region_feat, region_mask
 
-    def forward(self, input_ids, attention_mask, image_tensor=None, targets: Optional[List[List[EntityTarget]]] = None, labels=None):
+    def forward(self, input_ids, attention_mask, image_tensor=None, targets: Optional[List[List[EntityTarget]]] = None, labels=None, decode_thr=0.1):
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         text_feat = self.dropout(text_out)
         B, L, H = text_feat.shape
@@ -645,7 +256,7 @@ class MQSPNSetNER(BaseNERModel):
         exist_logits = self.exist(fused_q, agg_t, agg_r)
 
         if targets is None:
-            return self.decode(start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask)
+            return self.decode(start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask, thr=decode_thr)
         return self.compute_loss(start_logits, end_logits, region_logits, exist_logits, q_type_ids, targets, attention_mask)
 
     def compute_loss(self, start_logits, end_logits, region_logits, exist_logits, q_type_ids, targets, attention_mask):
@@ -681,44 +292,209 @@ class MQSPNSetNER(BaseNERModel):
             idx_q, idx_m = hungarian_match(cost)
             exist_target_all[b, idx_q] = 1.0
             matched_count += len(idx_q)
+            
+            if b == 0:
+                print("gold entities:", [(g.start, g.end, g.type_id) for g in gold])
+                print("matched queries:", idx_q.tolist())
+                print("matched gold idx:", idx_m.tolist())
+                print("matched query types:", q_type_ids[idx_q].tolist())
+                for qi, mi in zip(idx_q.tolist(), idx_m.tolist()):
+                    ps = start_logits[b, qi].argmax().item()
+                    pe = end_logits[b, qi].argmax().item()
+                    print("gold span:", gold_start[mi].item(), gold_end[mi].item(),
+                          "pred span:", ps, pe)
+                print("exist_target sum:", exist_target_all[b].sum().item(),
+                      "total queries:", exist_target_all[b].numel())
+            
             loss_span = loss_span + F.cross_entropy(start_logits[b, idx_q], gold_start[idx_m]) + F.cross_entropy(end_logits[b, idx_q], gold_end[idx_m])
             gm = gold_reg[idx_m]
             ok = (gm >= 0)
             if ok.any():
                 loss_region = loss_region + F.cross_entropy(region_logits[b, idx_q[ok]], gm[ok])
 
-        loss_exist = F.binary_cross_entropy_with_logits(exist_logits, exist_target_all)
+        pos = exist_target_all.sum()
+        neg = exist_target_all.numel() - pos
+        pos_weight = (neg / (pos + 1e-6)).clamp(min=1.0)
+        loss_exist = F.binary_cross_entropy_with_logits(
+            exist_logits,
+            exist_target_all,
+            pos_weight=pos_weight
+        )
+        
+        if self.training:
+            with torch.no_grad():
+                prob = torch.sigmoid(exist_logits[0])
+                pos_mask = exist_target_all[0] == 1
+                if pos_mask.any():
+                    pos_prob = prob[pos_mask]
+                    neg_prob = prob[~pos_mask]
+                    print("exist prob pos mean:", pos_prob.mean().item())
+                    print("exist prob neg mean:", neg_prob.mean().item())
+        
         if matched_count > 0:
             return self.loss_w_span * loss_span / matched_count + self.loss_w_region * loss_region / matched_count + self.loss_w_exist * loss_exist
         else:
             return self.loss_w_exist * loss_exist
 
     @torch.no_grad()
-    def decode(self, start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask, thr=0.5, max_span_len=30):
+    def decode(self, start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask, thr=0.0, max_span_len=30):
         B, Q, L = start_logits.shape
         out = []
         exist_prob = torch.sigmoid(exist_logits)
+        
         for b in range(B):
             items = []
             valid_L = int(attention_mask[b].sum().item())
+            if valid_L <= 2:
+                out.append([])
+                continue
+            
+            valid_start = 1
+            valid_end = valid_L - 1
+            if valid_end <= valid_start:
+                out.append([])
+                continue
+            
             for q in range(Q):
                 p_exist = exist_prob[b, q].item()
                 if p_exist < thr:
                     continue
-                s = int(start_logits[b, q, :valid_L].argmax().item())
-                e = int(end_logits[b, q, :valid_L].argmax().item())
+                
+                s_logits = start_logits[b, q, valid_start:valid_end]
+                e_logits = end_logits[b, q, valid_start:valid_end]
+                
+                if s_logits.numel() == 0 or e_logits.numel() == 0:
+                    continue
+                
+                s_idx = s_logits.argmax().item()
+                e_idx = e_logits.argmax().item()
+                s = s_idx + valid_start
+                e = e_idx + valid_start
+                
                 if e < s:
                     s, e = e, s
-                if (e - s + 1) > max_span_len:
+                
+                span_len = e - s + 1
+                if span_len > max_span_len or span_len < 1:
                     continue
+                
+                if s < valid_start or e >= valid_end:
+                    continue
+                
                 r = int(region_logits[b, q].argmax().item())
                 t = int(q_type_ids[q].item())
                 items.append((s, e, t, r, p_exist))
+            
             items.sort(key=lambda x: x[-1], reverse=True)
             dedup = {}
             for it in items:
                 key = (it[0], it[1], it[2])
-                if key not in dedup:
+                if key not in dedup or dedup[key][-1] < it[-1]:
                     dedup[key] = it
             out.append(list(dedup.values()))
         return out
+
+
+if __name__ == "__main__":
+    from transformers import RobertaTokenizer
+    from PIL import Image
+    from torchvision import transforms
+    import argparse
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--text_encoder", type=str, default="bert")
+    parser.add_argument("--image_encoder", type=str, default="clip-patch32")
+    parser.add_argument("--use_image", action="store_true")
+    parser.add_argument("--slots_per_type", type=int, default=15)
+    parser.add_argument("--drop_prob", type=float, default=0.25)
+    parser.add_argument("--loss_w_span", type=float, default=1.0)
+    parser.add_argument("--loss_w_region", type=float, default=1.0)
+    parser.add_argument("--loss_w_exist", type=float, default=1.0)
+    config = parser.parse_args([])
+    
+    t_path = _resolve_path(script_dir, config.text_encoder)
+    if t_path is None:
+        print(f"警告: 无法找到模型路径 {config.text_encoder}")
+        print(f"尝试查找路径: /root/autodl-fs/{config.text_encoder} 或 {script_dir}/{config.text_encoder}")
+        raise ValueError(f"无法找到模型路径: {config.text_encoder}")
+    print(f"使用模型路径: {t_path}")
+    
+    has_roberta_files = all(os.path.exists(os.path.join(t_path, f)) for f in ["vocab.json", "merges.txt"])
+    has_bert_files = os.path.exists(os.path.join(t_path, "vocab.txt"))
+    
+    if has_roberta_files:
+        tokenizer = RobertaTokenizer.from_pretrained(t_path, local_files_only=True)
+        print("使用RobertaTokenizer")
+    elif has_bert_files:
+        from transformers import BertTokenizer
+        tokenizer = BertTokenizer.from_pretrained(t_path, local_files_only=True)
+        print("使用BertTokenizer")
+    else:
+        raise ValueError(f"在 {t_path} 未找到 vocab.json/merges.txt 或 vocab.txt，无法初始化 tokenizer")
+    type_names = ["PER", "ORG", "LOC", "MISC"]
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MQSPNSetNER(config, tokenizer=tokenizer, type_names=type_names)
+    model.eval()
+    model.to(device)
+    
+    text = "Barack Obama visited Beijing yesterday."
+    encoded = tokenizer(text, padding="max_length", max_length=128, truncation=True, return_tensors="pt")
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    
+    if config.use_image:
+        img = Image.new("RGB", (224, 224), color="white")
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        image_tensor = transform(img).unsqueeze(0).to(device)
+    else:
+        image_tensor = None
+    
+    print("测试前向传播...")
+    with torch.no_grad():
+        results = model.forward(input_ids, attention_mask, image_tensor)
+    
+    print("前向传播成功")
+    print(f"解码结果数量: {len(results[0])}")
+    for i, (s, e, t, r, p) in enumerate(results[0]):
+        type_name = type_names[t] if t < len(type_names) else f"TYPE_{t}"
+        span_text = tokenizer.decode(input_ids[0][s:e+1], skip_special_tokens=False)
+        print(f"实体 {i+1}: [{s}, {e}] 类型={type_name} 区域={r} 概率={p:.4f} 文本={span_text}")
+    
+    print("\n测试直接调用decode方法...")
+    with torch.no_grad():
+        text_out = model.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        text_feat = model.dropout(text_out)
+        B, L, H = text_feat.shape
+        
+        if config.use_image and image_tensor is not None:
+            region_feat, region_mask = model._get_region_feat(image_tensor)
+        else:
+            region_feat = torch.zeros(B, 1, H, device=text_feat.device)
+            region_mask = torch.ones(B, 1, device=text_feat.device, dtype=torch.long)
+        
+        type_q = model.ptqg()
+        q, q_type_ids = model.mqs(type_q)
+        queries = q.unsqueeze(0).expand(B, -1, -1)
+        fused_q = model.qfnet(queries, text_feat, attention_mask, region_feat, region_mask)
+        start_logits, end_logits = model.sbl(fused_q, text_feat, attention_mask)
+        region_logits = model.crm(fused_q, region_feat, region_mask)
+        wt_t = F.softmax(start_logits, dim=-1)
+        agg_t = torch.matmul(wt_t, text_feat)
+        wt_r = F.softmax(region_logits, dim=-1)
+        agg_r = torch.matmul(wt_r, region_feat)
+        exist_logits = model.exist(fused_q, agg_t, agg_r)
+        
+        decode_results = model.decode(start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask)
+    
+    print("decode方法调用成功")
+    print(f"解码结果数量: {len(decode_results[0])}")
+    for i, (s, e, t, r, p) in enumerate(decode_results[0]):
+        type_name = type_names[t] if t < len(type_names) else f"TYPE_{t}"
+        span_text = tokenizer.decode(input_ids[0][s:e+1], skip_special_tokens=False)
+        print(f"实体 {i+1}: [{s}, {e}] 类型={type_name} 区域={r} 概率={p:.4f} 文本={span_text}")

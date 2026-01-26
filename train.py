@@ -2,7 +2,6 @@
 # @Time    : 2025/7/22 下午1:13
 # @Author  : liguochun
 # @FileName: train.py
-# @Software: PyCharm
 # @Email   ：liguochun0304@163.com
 import json
 import os
@@ -19,9 +18,8 @@ from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from model import build_model
+from model import MQSPNSetNER
 from test import evaluate_model
-from test import load_config
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 STORAGE_ROOT = "/root/autodl-fs"
@@ -137,10 +135,9 @@ def train(config):
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])])
     processor = MMPNERProcessor(data_path, config.text_encoder)
-    use_set_prediction = (getattr(config, "model", None) == "mqspn_set")
     train_dataset = MMPNERDataset(
         processor, transform, img_path=img_path, max_seq=config.max_len,
-        sample_ratio=1.0, mode='train', set_prediction=use_set_prediction
+        sample_ratio=1.0, mode='train', set_prediction=True
     )
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -156,7 +153,7 @@ def train(config):
         max_seq=config.max_len,
         sample_ratio=1.0,
         mode='valid',
-        set_prediction=use_set_prediction
+        set_prediction=True
     )
 
     val_loader = DataLoader(
@@ -170,39 +167,24 @@ def train(config):
 
     config.num_labels = len(train_dataset.label_mapping)
 
-    tokenizer = None
-    type_names = None
-    if use_set_prediction:
-        tokenizer = processor.tokenizer
-        type_names = train_dataset.type_names
+    tokenizer = processor.tokenizer
+    type_names = train_dataset.type_names
 
     start_epoch = 0
     best_f1 = 0.0
-    if config.continue_train_name == "None":
-        # 正常首次训练
-        model = build_model(config, tokenizer=tokenizer, type_names=type_names).to(device)
-    else:
+    model = MQSPNSetNER(config, tokenizer=tokenizer, type_names=type_names).to(device)
+    
+    if config.continue_train_name != "None":
         SAVE_ROOT = os.path.join(STORAGE_ROOT, "save_models")
-        # 从 save_models/<name> 读取先前 config 以确保结构一致
         ckpt_dir = os.path.join(SAVE_ROOT, config.continue_train_name)
-        prev_cfg = load_config(config.continue_train_name)  # 你已有的函数
-
-        # 用先前配置构建结构，但运行参数沿用当前命令行（比如新的 LR/drop/align 等）
-        prev_use_set_prediction = (getattr(prev_cfg, "model", None) == "mqspn_set")
-        prev_tokenizer = processor.tokenizer if prev_use_set_prediction else None
-        prev_type_names = train_dataset.type_names if prev_use_set_prediction else None
-        model = build_model(prev_cfg, tokenizer=prev_tokenizer, type_names=prev_type_names).to(device)
 
     no_decay = ["bias", "LayerNorm.weight", "LayerNorm.bias"]
 
     # ---- 互斥划分参数：确保同一个 tensor 只落在一个组里 ----
-    param_roberta, param_clip, param_downstream = [], [], []
+    param_roberta, param_downstream = [], []
     for n, p in model.named_parameters():
         if n.startswith("text_encoder."):
             param_roberta.append((n, p))
-        elif n.startswith("clip_vision.") or n.startswith("clip.vision_model."):
-            # 兼容两种命名：你自己模块里的 clip_vision.*，以及 transformers 的 clip.vision_model.*
-            param_clip.append((n, p))
         else:
             param_downstream.append((n, p))
 
@@ -228,11 +210,6 @@ def train(config):
     optimizer_grouped_parameters += build_groups(param_downstream,
                                                  config.downs_en_lr,
                                                  config.weight_decay_rate)
-    # CLIP视觉塔（仅在 --vision_trainable 时加入优化器）
-    if getattr(config, "vision_trainable", False):
-        optimizer_grouped_parameters += build_groups(param_clip,
-                                                     config.clip_lr,
-                                                     config.weight_decay_rate)
 
     # ---- 去重校验（防止任何参数出现在多个组）----
     seen = set()
@@ -248,9 +225,7 @@ def train(config):
         return sum(p.numel() for _, p in named_params)
 
     print("\n[DEBUG] param grouping snapshot")
-    print(" - roberta  tensors:", len(param_roberta), " params:", count_params(param_roberta))
-    print(" - clip     tensors:", len(param_clip), " params:", count_params(param_clip),
-          " (vision_trainable=", getattr(config, "vision_trainable", False), ")")
+    print(" - text_encoder tensors:", len(param_roberta), " params:", count_params(param_roberta))
     print(" - downstream tensors:", len(param_downstream), " params:", count_params(param_downstream))
     print()
 
@@ -277,8 +252,16 @@ def train(config):
         best_f1 = state["best_f1"]
 
     global_step = 0
+    freeze_exist_epochs = 2
     try:
         for epoch in range(start_epoch, config.epochs + 1):
+            if epoch < freeze_exist_epochs:
+                for p in model.exist.parameters():
+                    p.requires_grad = False
+            else:
+                for p in model.exist.parameters():
+                    p.requires_grad = True
+            
             model.train()
             total_loss = 0.0
 
@@ -292,26 +275,17 @@ def train(config):
             # image_tensor = batch[3].to(device, non_blocking=True)
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
                 images = batch.get("image", None)
                 if images is not None:
                     images = images.to(device)
 
-                if use_set_prediction:
-                    targets = batch.get("targets", None)
-                    loss = model(
-                        input_ids,
-                        attention_mask,
-                        image_tensor=images,
-                        targets=targets,
-                    )
-                else:
-                    loss = model(
-                        input_ids,
-                        attention_mask,
-                        image_tensor=images,
-                        labels=labels,
-                    )
+                targets = batch.get("targets", None)
+                loss = model(
+                    input_ids,
+                    attention_mask,
+                    image_tensor=images,
+                    targets=targets,
+                )
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -347,7 +321,6 @@ def train(config):
         # f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
             acc, f1, p, r = evaluate_model(
                 model, val_loader, device, train_dataset.label_mapping,
-                is_set_prediction=use_set_prediction,
                 type_names=type_names,
                 label_mapping=train_dataset.label_mapping
             )

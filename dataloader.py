@@ -2,7 +2,6 @@
 # @Time    : 2025/7/22 上午11:05
 # @Author  : liguochun
 # @FileName: dataloader.py
-# @Software: PyCharm
 # @Email   ：liguochun0304@163.com
 import json
 import logging
@@ -58,7 +57,7 @@ def get_entity_type_names(label_mapping: Dict[str, int]) -> List[str]:
     return sorted(types)
 
 
-def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str], label_mapping: Dict[str, int], ignore_special: bool = True) -> List[int]:
+def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str], label_mapping: Dict[str, int], ignore_special: bool = True, valid_len: int = None) -> List[int]:
     """
     将实体列表转换回 BIO 序列
     Args:
@@ -67,10 +66,13 @@ def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str],
         type_names: 实体类型名称列表
         label_mapping: 标签到 ID 的映射
         ignore_special: 是否忽略 [CLS] 和 [SEP] 位置（默认 True，即从位置 1 开始）
+        valid_len: 有效序列长度（用于边界检查，如果为None则使用seq_len）
     Returns:
         BIO 标签序列（List[int]）
     """
     bio_seq = [label_mapping.get("O", 0)] * seq_len
+    if valid_len is None:
+        valid_len = seq_len
     
     for span in spans:
         start, end = span.start, span.end
@@ -90,7 +92,10 @@ def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str],
             continue
         
         if ignore_special:
-            if start < 1 or end < 1 or start >= seq_len - 1 or end >= seq_len - 1:
+            if start < 1 or end < 1:
+                continue
+            max_pos = min(valid_len - 1, seq_len - 1)
+            if start > max_pos or end > max_pos:
                 continue
         else:
             if start < 0 or end < 0 or start >= seq_len or end >= seq_len:
