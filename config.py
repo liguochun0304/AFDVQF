@@ -48,7 +48,7 @@ def get_config():
                         help="每个实体类型的slot数量")
     parser.add_argument("--loss_w_span", type=float, default=1.0,
                         help="span边界损失权重")
-    parser.add_argument("--loss_w_region", type=float, default=1.0,
+    parser.add_argument("--loss_w_region", type=float, default=0.2,
                         help="region匹配损失权重")
     parser.add_argument("--loss_w_exist", type=float, default=0.05,
                         help="存在性损失权重")

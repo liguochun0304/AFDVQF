@@ -62,5 +62,5 @@ python3 ../train.py \
   --model "mqspn_set" \
   --slots_per_type 15 \
   --loss_w_span 1.0 \
-  --loss_w_region 1.0 \
-  --loss_w_exist 1.0
+  --loss_w_region 0.2 \
+  --loss_w_exist 0.05

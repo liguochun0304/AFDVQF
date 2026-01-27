@@ -286,6 +286,8 @@ def train(config):
                     image_tensor=images,
                     targets=targets,
                 )
+                if random.random() < 0.01:
+                    print(f"loss_span={getattr(model, 'last_loss_span', None)} loss_region={getattr(model, 'last_loss_region', None)} loss_exist={getattr(model, 'last_loss_exist', None)}")
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()

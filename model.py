@@ -261,27 +261,32 @@ class MQSPNSetNER(BaseNERModel):
 
     def compute_loss(self, start_logits, end_logits, region_logits, exist_logits, q_type_ids, targets, attention_mask):
         B, Q, L = start_logits.shape
-        loss_span = torch.tensor(0.0, device=start_logits.device)
-        loss_region = torch.tensor(0.0, device=start_logits.device)
-        exist_target_all = torch.zeros(B, Q, device=start_logits.device)
-        matched_count = 0
+        device = start_logits.device
+
+        loss_span_sum = torch.tensor(0.0, device=device)
+        loss_region_sum = torch.tensor(0.0, device=device)
+        exist_target_all = torch.zeros(B, Q, device=device)
+
+        span_cnt = 0          # 用于归一化 span
+        region_cnt = 0        # 用于归一化 region（仅统计有 region 标注的 matched）
 
         for b in range(B):
             gold = targets[b]
             if len(gold) == 0:
                 continue
-            gold_start = torch.tensor([g.start for g in gold], device=start_logits.device, dtype=torch.long)
-            gold_end = torch.tensor([g.end for g in gold], device=start_logits.device, dtype=torch.long)
-            gold_type = torch.tensor([g.type_id for g in gold], device=start_logits.device, dtype=torch.long)
-            gold_reg = torch.tensor([g.region_id for g in gold], device=start_logits.device, dtype=torch.long)
+
+            gold_start = torch.tensor([g.start for g in gold], device=device, dtype=torch.long)
+            gold_end   = torch.tensor([g.end   for g in gold], device=device, dtype=torch.long)
+            gold_type  = torch.tensor([g.type_id for g in gold], device=device, dtype=torch.long)
+            gold_reg   = torch.tensor([g.region_id for g in gold], device=device, dtype=torch.long)
             M = gold_start.numel()
 
-            p_s = F.log_softmax(start_logits[b], dim=-1)
-            p_e = F.log_softmax(end_logits[b], dim=-1)
-            cost_span = -(p_s[:, gold_start] + p_e[:, gold_end])
+            p_s = F.log_softmax(start_logits[b], dim=-1)  # (Q,L)
+            p_e = F.log_softmax(end_logits[b], dim=-1)    # (Q,L)
+            cost_span = -(p_s[:, gold_start] + p_e[:, gold_end])  # (Q,M)
 
-            p_r = F.log_softmax(region_logits[b], dim=-1)
-            cost_reg = torch.zeros(Q, M, device=start_logits.device)
+            p_r = F.log_softmax(region_logits[b], dim=-1)  # (Q,R)
+            cost_reg = torch.zeros(Q, M, device=device)
             grounded_mask = (gold_reg >= 0)
             if grounded_mask.any():
                 idx = torch.where(grounded_mask)[0]
@@ -289,37 +294,37 @@ class MQSPNSetNER(BaseNERModel):
 
             type_mismatch = (q_type_ids.unsqueeze(1) != gold_type.unsqueeze(0)).float()
             cost = cost_span + cost_reg + 1000.0 * type_mismatch
-            idx_q, idx_m = hungarian_match(cost)
+
+            idx_q, idx_m = hungarian_match(cost)  # len = min(Q, M)
             exist_target_all[b, idx_q] = 1.0
-            matched_count += len(idx_q)
-            
-            loss_span = loss_span + F.cross_entropy(start_logits[b, idx_q], gold_start[idx_m]) + F.cross_entropy(end_logits[b, idx_q], gold_end[idx_m])
+
+            # ✅ 用 sum，再手动除 count
+            loss_span_sum = loss_span_sum + F.cross_entropy(start_logits[b, idx_q], gold_start[idx_m], reduction="sum")
+            loss_span_sum = loss_span_sum + F.cross_entropy(end_logits[b, idx_q],   gold_end[idx_m],   reduction="sum")
+            span_cnt += idx_q.numel()
+
             gm = gold_reg[idx_m]
             ok = (gm >= 0)
             if ok.any():
-                loss_region = loss_region + F.cross_entropy(region_logits[b, idx_q[ok]], gm[ok])
+                loss_region_sum = loss_region_sum + F.cross_entropy(region_logits[b, idx_q[ok]], gm[ok], reduction="sum")
+                region_cnt += int(ok.sum().item())
 
+        # exist loss（保持你原逻辑，但建议权重别太大，下面第2点说）
         pos = exist_target_all.sum()
         neg = exist_target_all.numel() - pos
         pos_weight = (neg / (pos + 1e-6)).clamp(min=1.0)
-        loss_exist = F.binary_cross_entropy_with_logits(
-            exist_logits,
-            exist_target_all,
-            pos_weight=pos_weight
-        )
-        
-        if self.training:
-            with torch.no_grad():
-                prob = torch.sigmoid(exist_logits[0])
-                pos_mask = exist_target_all[0] == 1
-                if pos_mask.any():
-                    pos_prob = prob[pos_mask]
-                    neg_prob = prob[~pos_mask]
-        
-        if matched_count > 0:
-            return self.loss_w_span * loss_span / matched_count + self.loss_w_region * loss_region / matched_count + self.loss_w_exist * loss_exist
-        else:
-            return self.loss_w_exist * loss_exist
+        loss_exist = F.binary_cross_entropy_with_logits(exist_logits, exist_target_all, pos_weight=pos_weight)
+
+        # ✅ 正确归一
+        loss_span = loss_span_sum / span_cnt if span_cnt > 0 else torch.tensor(0.0, device=device)
+        loss_region = loss_region_sum / region_cnt if region_cnt > 0 else torch.tensor(0.0, device=device)
+
+        self.last_loss_span = float(loss_span.detach().cpu().item())
+        self.last_loss_region = float(loss_region.detach().cpu().item())
+        self.last_loss_exist = float(loss_exist.detach().cpu().item())
+
+        return self.loss_w_span * loss_span + self.loss_w_region * loss_region + self.loss_w_exist * loss_exist
+
 
     @torch.no_grad()
     def decode(self, start_logits, end_logits, region_logits, exist_logits, q_type_ids, attention_mask, thr=0.0, max_span_len=30):
@@ -394,8 +399,8 @@ if __name__ == "__main__":
     parser.add_argument("--slots_per_type", type=int, default=15)
     parser.add_argument("--drop_prob", type=float, default=0.25)
     parser.add_argument("--loss_w_span", type=float, default=1.0)
-    parser.add_argument("--loss_w_region", type=float, default=1.0)
-    parser.add_argument("--loss_w_exist", type=float, default=1.0)
+    parser.add_argument("--loss_w_region", type=float, default=0.2)
+    parser.add_argument("--loss_w_exist", type=float, default=0.05)
     config = parser.parse_args([])
     
     t_path = _resolve_path(script_dir, config.text_encoder)
