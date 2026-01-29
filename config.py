@@ -1,14 +1,8 @@
 # -*- coding: utf-8 -*-
-# @Time    : 2025/7/23 下午7:24
-# @Author  : liguochun
-# @FileName: config.py
-# @E-mail  : liguochun0304@163.com
-# config.py
 import argparse
 
 
 def get_config():
-    print("[config] 开始解析配置参数")
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -33,26 +27,20 @@ def get_config():
     parser.add_argument("--dataset_name", type=str, default="twitter2017")
 
     parser.add_argument("--ex_project", type=str, default="MNER")
-    parser.add_argument("--ex_name", type=str, default="mqspn_set")
+    parser.add_argument("--ex_name", type=str, default="mqspn")
     parser.add_argument("--ex_nums", type=str, default="A0")
 
-    parser.add_argument('--use_image', action='store_true', help='是否使用图像模态')
+    parser.add_argument('--use_image', action='store_true')
 
-    parser.add_argument("--model", type=str, default="mqspn_set",
-                        help="模型名称（用于保存路径）")
+    parser.add_argument("--model", type=str, default="mqspn")
+    parser.add_argument("--decoder_type", type=str, default="span")
 
-    parser.add_argument("--continue_train_name", type=str, default="None",
-                        help="保存于 save_models/ 下的目录名，用于继续训练（加载权重或完整状态）")
+    parser.add_argument("--continue_train_name", type=str, default="None")
 
-    parser.add_argument("--slots_per_type", type=int, default=15,
-                        help="每个实体类型的slot数量")
-    parser.add_argument("--loss_w_span", type=float, default=1.0,
-                        help="span边界损失权重")
-    parser.add_argument("--loss_w_region", type=float, default=0.2,
-                        help="region匹配损失权重")
-    parser.add_argument("--loss_w_exist", type=float, default=0.05,
-                        help="存在性损失权重")
+    parser.add_argument("--slots_per_type", type=int, default=15)
+    parser.add_argument("--qfnet_layers", type=int, default=2)
+    parser.add_argument("--loss_w_span", type=float, default=1.0)
+    parser.add_argument("--loss_w_exist", type=float, default=0.5)
 
     args = parser.parse_args()
-    print(f"[config] 配置解析完成: device={args.device}, model={args.model}, dataset={args.dataset_name}")
     return args

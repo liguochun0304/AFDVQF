@@ -1,10 +1,111 @@
 from typing import Dict, List, Tuple, Optional, Any
 import torch
 
-from dataloader import bio_to_spans  # 继续用你项目里的 BIO->span 实现
+from dataloader import bio_to_spans, get_entity_type_names
 
-SpanTuple = Tuple[int, int, int]  # (start, end, type_id)  坐标在 trimmed 序列里（已去 CLS/SEP），end inclusive
-Chunk = Tuple[str, int, int]      # (type_name, start, end_exclusive)
+SpanTuple = Tuple[int, int, int]
+Chunk = Tuple[str, int, int]
+
+
+def evaluate_crf_model(
+    model,
+    val_loader,
+    device: torch.device,
+    label_mapping: Dict[str, int],
+    type_names: List[str],
+    debug_n: int = 3,
+) -> Tuple[float, float, float, float]:
+    model.eval()
+    idx2tag = {v: k for k, v in label_mapping.items()}
+    type_name2id = {name: i for i, name in enumerate(type_names)}
+
+    correct = 0.0
+    total_pred = 0.0
+    total_gold = 0.0
+    exact_flags = []
+    type_stats = {t: [0, 0, 0] for t in type_names}
+    debug_samples: List[Tuple[List[str], List[str], List[SpanTuple], List[SpanTuple], List[Chunk], List[Chunk]]] = []
+
+    with torch.inference_mode():
+        for batch in val_loader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+            images = batch.get("image", None)
+            if images is not None:
+                images = images.to(device)
+
+            pred_tags_batch = model(input_ids, attention_mask, image_tensor=images)
+
+            bs = labels.size(0)
+            for i in range(bs):
+                valid_len = int(attention_mask[i].sum().item())
+                if valid_len <= 2:
+                    exact_flags.append(1.0)
+                    continue
+
+                raw_pred = pred_tags_batch[i]
+                pred_seq = raw_pred[1:valid_len-1] if isinstance(raw_pred, list) else raw_pred[1:valid_len-1].cpu().tolist()
+                gold_seq = labels[i, 1:valid_len-1].cpu().tolist()
+
+                pred_tag_strs = [idx2tag.get(tid, "O") for tid in pred_seq]
+                gold_tag_strs = [idx2tag.get(tid, "O") for tid in gold_seq]
+
+                pred_spans_ent = bio_to_spans(pred_seq, idx2tag, type_name2id)
+                gold_spans_ent = bio_to_spans(gold_seq, idx2tag, type_name2id)
+
+                pred_set = {(e.start, e.end, e.type_id) for e in pred_spans_ent}
+                gold_set = {(e.start, e.end, e.type_id) for e in gold_spans_ent}
+
+                pred_spans = [(e.start, e.end, e.type_id) for e in pred_spans_ent]
+                gold_spans = [(e.start, e.end, e.type_id) for e in gold_spans_ent]
+                pred_chunks = _spans_to_chunks(pred_spans, type_names)
+                gold_chunks = _spans_to_chunks(gold_spans, type_names)
+
+                correct += len(pred_set & gold_set)
+                total_pred += len(pred_set)
+                total_gold += len(gold_set)
+                exact_flags.append(1.0 if pred_set == gold_set else 0.0)
+
+                for ent_type in type_names:
+                    pset = {c for c in pred_chunks if c[0] == ent_type}
+                    gset = {c for c in gold_chunks if c[0] == ent_type}
+                    type_stats[ent_type][0] += len(pset & gset)
+                    type_stats[ent_type][1] += len(pset)
+                    type_stats[ent_type][2] += len(gset)
+
+                if len(debug_samples) < debug_n:
+                    debug_samples.append((pred_tag_strs, gold_tag_strs, pred_spans, gold_spans, sorted(pred_chunks), sorted(gold_chunks)))
+
+    p = correct / total_pred if total_pred > 0 else 0.0
+    r = correct / total_gold if total_gold > 0 else 0.0
+    f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+    acc = float(sum(exact_flags) / len(exact_flags)) if exact_flags else 0.0
+
+    print("=" * 60)
+    print("CRF decode 评估 (BIO tag → spans)")
+    print("=" * 60)
+    for i, (pred_tags, gold_tags, ps, gs, pc, gc) in enumerate(debug_samples, 1):
+        ps_str = [(s, e, type_names[t]) for s, e, t in ps]
+        gs_str = [(s, e, type_names[t]) for s, e, t in gs]
+        print(f"\n样本 {i}:")
+        print(f"  预测 tag序列: {pred_tags}")
+        print(f"  真实 tag序列: {gold_tags}")
+        print(f"  预测 spans: {ps_str}")
+        print(f"  真实 spans: {gs_str}")
+        print(f"  预测 chunks: {pc}")
+        print(f"  真实 chunks: {gc}")
+
+    print(f"\n总体: Acc(ExactMatch)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
+    print("\n按类别:")
+    for ent_type in type_names:
+        cp, tp, tc = type_stats[ent_type]
+        p_c = cp / tp if tp > 0 else 0.0
+        r_c = cp / tc if tc > 0 else 0.0
+        f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
+        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f}")
+    print("=" * 60)
+    return acc, f1, p, r
 
 
 def _reverse_map(label2id: Dict[str, int]) -> Dict[int, str]:
@@ -66,14 +167,9 @@ def _pred_to_trimmed_spans(
     raw_pred_spans: Any,
     valid_len: int,
     num_types: int,
-    score_index: int = 4,          # 你的 decode 输出 (s,e,t,r,p) -> p 在 index=4
+    score_index: int = 4,
     score_thr: Optional[float] = None,
 ) -> List[SpanTuple]:
-    """
-    pred spans: 原始坐标（含 CLS/SEP） -> trimmed 坐标（去 CLS/SEP）
-      - 你的 decode() 已保证 s,e 在 [1, valid_len-2]
-      - trimmed 后坐标：s'=s-1, e'=e-1，范围 [0, valid_len-3]
-    """
     if not raw_pred_spans or valid_len <= 2:
         return []
 
@@ -92,8 +188,6 @@ def _pred_to_trimmed_spans(
             continue
         if not (0 <= t < num_types):
             continue
-
-        # 要求落在有效 token（你 decode 已做，但这里再保险）
         if not (1 <= s < valid_len - 1 and 1 <= e < valid_len - 1):
             continue
 
@@ -144,27 +238,37 @@ def evaluate_predictions(
     for raw_pred, label_ids, mask in zip(preds_per_sample, labels_per_sample, masks_per_sample):
         valid_len = int(sum(mask))
         if valid_len <= 2:
-            # 只有 CLS/SEP 或空
             pred_chunks = set()
             gold_chunks = set()
             exact_flags.append(1.0)
+            _sample_idx += 1
             continue
 
-        # --- gold：直接切 [1:-1]，并把 X/PAD 视作 O（简单且稳） ---
         gold_trimmed = label_ids[:valid_len][1:valid_len - 1]
-        # 把 X/PAD 的 lid 映射成 O
         gold_norm = []
+        current_entity_id = None
         for lid in gold_trimmed:
             tag = idx2tag.get(lid, "O")
             if tag in {"X", "PAD"}:
-                gold_norm.append(o_id)
+                if current_entity_id is not None:
+                    gold_norm.append(current_entity_id)
+                else:
+                    gold_norm.append(o_id)
+            elif tag.startswith("B-"):
+                gold_norm.append(lid)
+                etype = tag[2:]
+                i_tag = f"I-{etype}"
+                current_entity_id = label2id.get(i_tag, lid)
+            elif tag.startswith("I-"):
+                gold_norm.append(lid)
+                current_entity_id = lid
             else:
                 gold_norm.append(lid)
+                current_entity_id = None
 
         gold_entities = bio_to_spans(gold_norm, idx2tag, type_name2id)
         gold_spans: List[SpanTuple] = [(int(e.start), int(e.end), int(e.type_id)) for e in gold_entities]
 
-        # --- pred：decode 输出 -> trimmed（-1） ---
         pred_spans = _pred_to_trimmed_spans(
             raw_pred_spans=raw_pred,
             valid_len=valid_len,
@@ -196,9 +300,8 @@ def evaluate_predictions(
     f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
     acc = float(sum(exact_flags) / len(exact_flags)) if exact_flags else 0.0
 
-    # debug 打印
     print("=" * 60)
-    print("Span-level Evaluation (trimmed: remove CLS/SEP)")
+    print("Span decode 评估 (trimmed: remove CLS/SEP)")
     print("=" * 60)
     for i, (ps, gs, pc, gc) in enumerate(debug_samples, 1):
         ps_str = [(s, e, type_names[t]) for s, e, t in ps]

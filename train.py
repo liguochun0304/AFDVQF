@@ -18,7 +18,7 @@ from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from model import MQSPNSetNER
+from model import MQSPNModel, CRFNERModel, MQSPNOriginalModel, build_model
 from test import evaluate_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -172,7 +172,14 @@ def train(config):
 
     start_epoch = 0
     best_f1 = 0.0
-    model = MQSPNSetNER(config, tokenizer=tokenizer, type_names=type_names).to(device)
+    
+    model_name = getattr(config, 'model', 'mqspn')
+    if model_name == 'crf':
+        model = CRFNERModel(config, tokenizer=tokenizer, label_mapping=train_dataset.label_mapping).to(device)
+    elif model_name == 'mqspn_original':
+        model = MQSPNOriginalModel(config, tokenizer=tokenizer, type_names=type_names, label_mapping=train_dataset.label_mapping).to(device)
+    else:
+        model = MQSPNModel(config, tokenizer=tokenizer, type_names=type_names).to(device)
     
     if config.continue_train_name != "None":
         SAVE_ROOT = os.path.join(STORAGE_ROOT, "save_models")
@@ -183,7 +190,7 @@ def train(config):
     # ---- 互斥划分参数：确保同一个 tensor 只落在一个组里 ----
     param_roberta, param_downstream = [], []
     for n, p in model.named_parameters():
-        if n.startswith("text_encoder."):
+        if n.startswith("text_encoder.") or n.startswith("bert."):
             param_roberta.append((n, p))
         else:
             param_downstream.append((n, p))
@@ -252,15 +259,16 @@ def train(config):
         best_f1 = state["best_f1"]
 
     global_step = 0
-    freeze_exist_epochs = 2
+    freeze_exist_epochs = 0
     try:
         for epoch in range(start_epoch, config.epochs + 1):
-            if epoch < freeze_exist_epochs:
-                for p in model.exist.parameters():
-                    p.requires_grad = False
-            else:
-                for p in model.exist.parameters():
-                    p.requires_grad = True
+            if hasattr(model, 'exist'):
+                if epoch < freeze_exist_epochs:
+                    for p in model.exist.parameters():
+                        p.requires_grad = False
+                else:
+                    for p in model.exist.parameters():
+                        p.requires_grad = True
             
             model.train()
             total_loss = 0.0
@@ -279,15 +287,15 @@ def train(config):
                 if images is not None:
                     images = images.to(device)
 
-                targets = batch.get("targets", None)
-                loss = model(
-                    input_ids,
-                    attention_mask,
-                    image_tensor=images,
-                    targets=targets,
-                )
-                if random.random() < 0.01:
-                    print(f"loss_span={getattr(model, 'last_loss_span', None)} loss_region={getattr(model, 'last_loss_region', None)} loss_exist={getattr(model, 'last_loss_exist', None)}")
+                use_crf_train = (getattr(config, 'model', 'mqspn') == 'crf') or (getattr(config, 'model') == 'mqspn_original' and getattr(config, 'decoder_type', 'span') == 'crf')
+                if use_crf_train:
+                    labels = batch["labels"].to(device)
+                    loss = model(input_ids, attention_mask, image_tensor=images, labels=labels)
+                else:
+                    targets = batch.get("targets", None)
+                    loss = model(input_ids, attention_mask, image_tensor=images, targets=targets)
+                    if random.random() < 0.01:
+                        print(f"loss_span={getattr(model, 'last_loss_span', None)} loss_region={getattr(model, 'last_loss_region', None)} loss_exist={getattr(model, 'last_loss_exist', None)}")
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -320,12 +328,19 @@ def train(config):
             writer.add_scalar("train/loss", avg_loss, epoch)
             print("\n✅ Epoch {0} Train Loss: {1:.4f}".format(epoch, avg_loss))
 
-        # f1, report = evaluate(model, val_loader, device, train_dataset.id2label)
-            acc, f1, p, r = evaluate_model(
-                model, val_loader, device, train_dataset.label_mapping,
-                type_names=type_names,
-                label_mapping=train_dataset.label_mapping
-            )
+            use_crf_eval = (model_name == 'crf') or (model_name == 'mqspn_original' and getattr(config, 'decoder_type', 'span') == 'crf')
+            if use_crf_eval:
+                from test import evaluate_crf_model
+                acc, f1, p, r = evaluate_crf_model(
+                    model, val_loader, device, train_dataset.label_mapping, type_names=type_names
+                )
+            else:
+                acc, f1, p, r = evaluate_model(
+                    model, val_loader, device, train_dataset.label_mapping,
+                    type_names=type_names,
+                    label_mapping=train_dataset.label_mapping,
+                    decode_thr=0.1
+                )
             print(
                 "🎯Epoch {0} Eval F1: {1:.4f} precision: {2:.4f} recall: {3:.4f} acc:{4:.4f}".format(epoch, f1, p, r, acc))
             writer.add_scalar("eval/f1", f1, epoch)
