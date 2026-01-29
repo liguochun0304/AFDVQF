@@ -57,6 +57,47 @@ def get_entity_type_names(label_mapping: Dict[str, int]) -> List[str]:
     return sorted(types)
 
 
+def normalize_labels_for_spans(
+    label_ids: List[int],
+    id2tag: Dict[int, str],
+    label2id: Dict[str, int],
+) -> List[int]:
+    """
+    将子词上的 X 还原为当前实体的 I-标签（仅当上一token为实体），
+    让 span 训练目标覆盖完整实体跨度。
+    """
+    out = []
+    current_entity_id = None
+    o_id = label2id.get("O", 0)
+
+    for lid in label_ids:
+        tag = id2tag.get(lid, "O")
+        if tag == "X":
+            if current_entity_id is not None:
+                out.append(current_entity_id)
+            else:
+                out.append(o_id)
+            continue
+
+        if tag.startswith("B-"):
+            out.append(lid)
+            etype = tag[2:]
+            i_tag = f"I-{etype}"
+            current_entity_id = label2id.get(i_tag, lid)
+            continue
+
+        if tag.startswith("I-"):
+            out.append(lid)
+            current_entity_id = lid
+            continue
+
+        # O / [CLS] / [SEP] / PAD 等：重置
+        out.append(lid)
+        current_entity_id = None
+
+    return out
+
+
 def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str], label_mapping: Dict[str, int], ignore_special: bool = True, valid_len: int = None) -> List[int]:
     """
     将实体列表转换回 BIO 序列
@@ -316,7 +357,8 @@ class MMPNERDataset(Dataset):
 
         if self.set_prediction:
             label_ids_list = labels.tolist()
-            targets = bio_to_spans(label_ids_list, self.id2tag, self.type_name2id)
+            norm_label_ids = normalize_labels_for_spans(label_ids_list, self.id2tag, self.label_mapping)
+            targets = bio_to_spans(norm_label_ids, self.id2tag, self.type_name2id)
 
         if self.img_path is not None:
             try:
