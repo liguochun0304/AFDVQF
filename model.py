@@ -141,17 +141,23 @@ class QueryGuidedFusionNet(nn.Module):
 class SpanBoundaryHead(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
-        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.t_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.start_bias = nn.Parameter(torch.zeros(1))
-        self.end_bias = nn.Parameter(torch.zeros(1))
+        self.q_proj_start = nn.Linear(hidden_dim, hidden_dim)
+        self.q_proj_end = nn.Linear(hidden_dim, hidden_dim)
+        self.t_proj_start = nn.Linear(hidden_dim, hidden_dim)
+        self.t_proj_end = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, queries, text_feat, text_mask):
-        q = self.q_proj(queries)
-        t = self.t_proj(text_feat)
-        logits = torch.matmul(q, t.transpose(1, 2)) / (q.size(-1) ** 0.5)
-        logits = logits.masked_fill((text_mask == 0).unsqueeze(1), float("-inf"))
-        return logits + self.start_bias, logits + self.end_bias
+        q_s = self.q_proj_start(queries)
+        t_s = self.t_proj_start(text_feat)
+        start_logits = torch.matmul(q_s, t_s.transpose(1, 2)) / (q_s.size(-1) ** 0.5)
+        start_logits = start_logits.masked_fill((text_mask == 0).unsqueeze(1), float("-inf"))
+
+        q_e = self.q_proj_end(queries)
+        t_e = self.t_proj_end(text_feat)
+        end_logits = torch.matmul(q_e, t_e.transpose(1, 2)) / (q_e.size(-1) ** 0.5)
+        end_logits = end_logits.masked_fill((text_mask == 0).unsqueeze(1), float("-inf"))
+
+        return start_logits, end_logits
 
 
 class RegionMatchHead(nn.Module):
