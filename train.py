@@ -106,7 +106,7 @@ def train(config):
     base_run_name = "{0}_train-{1}_{2}_{3}".format(
         datetime.now().strftime('%Y-%m-%d'),
         config.dataset_name,
-        str(config.model),
+        "mqspn_det_crf",
         config.ex_name,
     )
     save_root = os.path.join(STORAGE_ROOT, "save_models")
