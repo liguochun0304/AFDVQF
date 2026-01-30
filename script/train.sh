@@ -42,7 +42,7 @@ GRAD_ACC=2
 LOSS_W_SPAN=1.0
 LOSS_W_EXIST=0.5
 
-EX_NAME="crf_default"
+EX_NAME="test_origin_twitter2015"
 
 CMD=(
   python train.py
