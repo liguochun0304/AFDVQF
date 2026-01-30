@@ -157,6 +157,8 @@ class VisionRegionExtractor(nn.Module):
         if self._detector_device != device:
             self._detector.to(device)
             self._detector_device = device
+        # keep detector in eval mode even if parent model.train() is called
+        self._detector.eval()
 
     @torch.no_grad()
     def _detect_boxes(self, raw_images: torch.Tensor) -> List[torch.Tensor]:
@@ -169,6 +171,8 @@ class VisionRegionExtractor(nn.Module):
 
         # torchvision detector expects a list[Tensor(C,H,W)]
         imgs = [raw_images[b] for b in range(raw_images.size(0))]
+        # ensure eval mode (parent model.train() would otherwise flip it)
+        self._detector.eval()
         outputs = self._detector(imgs)
 
         boxes_list: List[torch.Tensor] = []
