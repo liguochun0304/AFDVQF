@@ -31,11 +31,19 @@ def evaluate_crf_model(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
-            images = batch.get("image", None)
-            if images is not None:
-                images = images.to(device)
+            image_tensor = batch.get("image_tensor", None)
+            raw_images = batch.get("raw_images", None)
+            if image_tensor is not None:
+                image_tensor = image_tensor.to(device)
+            if raw_images is not None:
+                raw_images = raw_images.to(device)
 
-            pred_tags_batch = model(input_ids, attention_mask, image_tensor=images)
+            pred_tags_batch = model(
+                input_ids,
+                attention_mask,
+                image_tensor=image_tensor,
+                raw_images=raw_images,
+            )
 
             bs = labels.size(0)
             for i in range(bs):
@@ -358,18 +366,37 @@ def evaluate_model(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
-            images = batch.get("image", None)
-            if images is not None:
-                images = images.to(device)
+            image_tensor = batch.get("image_tensor", None)
+            raw_images = batch.get("raw_images", None)
+            if image_tensor is not None:
+                image_tensor = image_tensor.to(device)
+            if raw_images is not None:
+                raw_images = raw_images.to(device)
 
             # 兼容 MQSPNSetNER.forward(decode_thr=...)
             if decode_thr is None:
-                preds = model(input_ids=input_ids, attention_mask=attention_mask, image_tensor=images)
+                preds = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    image_tensor=image_tensor,
+                    raw_images=raw_images,
+                )
             else:
                 try:
-                    preds = model(input_ids=input_ids, attention_mask=attention_mask, image_tensor=images, decode_thr=decode_thr)
+                    preds = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        image_tensor=image_tensor,
+                        raw_images=raw_images,
+                        decode_thr=decode_thr,
+                    )
                 except TypeError:
-                    preds = model(input_ids=input_ids, attention_mask=attention_mask, image_tensor=images)
+                    preds = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        image_tensor=image_tensor,
+                        raw_images=raw_images,
+                    )
 
             bs = labels.size(0)
             for i in range(bs):

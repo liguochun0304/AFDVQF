@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +10,14 @@ from transformers import CLIPModel, RobertaModel, BertModel
 from scipy.optimize import linear_sum_assignment
 from torchcrf import CRF
 
+# torchvision (detector + ops)
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.ops import nms
 
+
+# -----------------------------
+# Data structure
+# -----------------------------
 @dataclass
 class EntityTarget:
     start: int
@@ -18,6 +26,9 @@ class EntityTarget:
     region_id: int = -1
 
 
+# -----------------------------
+# Utils
+# -----------------------------
 def _resolve_path(script_dir, path):
     if not path:
         return None
@@ -57,6 +68,271 @@ def _best_span_indices(start_logits: torch.Tensor, end_logits: torch.Tensor, max
     return int(s_idx), int(e_idx)
 
 
+# -----------------------------
+# Vision extractor (NEW)
+# -----------------------------
+class VisionRegionExtractor(nn.Module):
+    """
+    region_mode:
+      - "clip_patches": use CLIP ViT patch tokens (your original behavior)
+      - "detector_regions": torchvision Faster R-CNN -> boxes -> crop -> CLIP encode each region
+    Inputs:
+      - image_tensor: CLIPProcessor output, [B,3,224,224] normalized (used for CLIP)
+      - raw_images: detector input, [B,3,H,W] float in [0,1] RGB (used for Faster R-CNN + cropping)
+    Outputs:
+      - region_feat: [B,R,H]
+      - region_mask: [B,R] (1 valid, 0 pad)
+    """
+
+    # OpenAI CLIP normalization constants (works for CLIP ViT models)
+    CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+    def __init__(self, clip: CLIPModel, vision_proj: nn.Module, hidden_dim: int, config, script_dir: str):
+        super().__init__()
+        self.clip = clip
+        self.vision_proj = vision_proj
+        self.hidden_dim = hidden_dim
+        self.script_dir = script_dir
+
+        self.region_mode = getattr(config, "region_mode", "clip_patches")  # "clip_patches" | "detector_regions"
+        self.region_add_global = bool(getattr(config, "region_add_global", False))
+
+        # detector settings (only used when region_mode == "detector_regions")
+        self.torch_home = getattr(config, "torch_home", "/root/autodl-fs/torch_cache")
+        self.detector_topk = int(getattr(config, "detector_topk", 10))
+        self.detector_score_thr = float(getattr(config, "detector_score_thr", 0.2))
+        self.detector_nms_iou = float(getattr(config, "detector_nms_iou", 0.7))
+        self.detector_ckpt = _resolve_path(script_dir, getattr(config, "detector_ckpt", None))
+
+        self._detector = None  # lazy init
+        self._detector_device = None
+
+    def _set_torch_home(self):
+        os.makedirs(self.torch_home, exist_ok=True)
+        os.environ["TORCH_HOME"] = self.torch_home
+        # torch.hub.set_dir is optional; env var is usually enough
+        try:
+            import torch.hub
+            torch.hub.set_dir(self.torch_home)
+        except Exception:
+            pass
+
+    def _init_detector(self):
+        if self._detector is not None:
+            return
+
+        self._set_torch_home()
+
+        # NOTE: this will download weights if not present (requires internet).
+        # If you are offline, provide config.detector_ckpt to load local state_dict.
+        det = fasterrcnn_resnet50_fpn(weights="DEFAULT")
+
+        if self.detector_ckpt is not None:
+            sd = torch.load(self.detector_ckpt, map_location="cpu")
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            # tolerate prefixes
+            new_sd = {}
+            for k, v in sd.items():
+                nk = k
+                if nk.startswith("module."):
+                    nk = nk[len("module."):]
+                new_sd[nk] = v
+            missing, unexpected = det.load_state_dict(new_sd, strict=False)
+            if missing:
+                raise RuntimeError(f"detector_ckpt missing keys: {missing[:20]}")
+            if unexpected:
+                # unexpected keys are usually fine when ckpt has extra metadata
+                pass
+
+        det.eval()
+        for p in det.parameters():
+            p.requires_grad = False
+        self._detector = det
+
+    def _ensure_detector_on(self, device: torch.device):
+        if self._detector is None:
+            self._init_detector()
+        if self._detector_device != device:
+            self._detector.to(device)
+            self._detector_device = device
+
+    @torch.no_grad()
+    def _detect_boxes(self, raw_images: torch.Tensor) -> List[torch.Tensor]:
+        """
+        raw_images: [B,3,H,W], float, RGB, range [0,1]
+        return: list of boxes per image, each [Ni,4] in xyxy (float)
+        """
+        device = raw_images.device
+        self._ensure_detector_on(device)
+
+        # torchvision detector expects a list[Tensor(C,H,W)]
+        imgs = [raw_images[b] for b in range(raw_images.size(0))]
+        outputs = self._detector(imgs)
+
+        boxes_list: List[torch.Tensor] = []
+        for out in outputs:
+            boxes = out["boxes"]  # [N,4]
+            scores = out["scores"]  # [N]
+            if boxes.numel() == 0:
+                boxes_list.append(boxes.new_zeros((0, 4)))
+                continue
+
+            keep = scores >= self.detector_score_thr
+            boxes = boxes[keep]
+            scores = scores[keep]
+
+            if boxes.numel() == 0:
+                boxes_list.append(boxes.new_zeros((0, 4)))
+                continue
+
+            # optional NMS
+            keep_idx = nms(boxes, scores, self.detector_nms_iou)
+            boxes = boxes[keep_idx]
+            scores = scores[keep_idx]
+
+            # top-k by score
+            if boxes.size(0) > self.detector_topk:
+                topk = torch.topk(scores, k=self.detector_topk, largest=True).indices
+                boxes = boxes[topk]
+
+            boxes_list.append(boxes)
+        return boxes_list
+
+    def _clip_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [3,H,W] in [0,1]
+        mean = torch.as_tensor(self.CLIP_MEAN, device=x.device, dtype=x.dtype).view(3, 1, 1)
+        std = torch.as_tensor(self.CLIP_STD, device=x.device, dtype=x.dtype).view(3, 1, 1)
+        return (x - mean) / std
+
+    @torch.no_grad()
+    def _encode_regions_with_clip(self, raw_images: torch.Tensor, boxes_list: List[torch.Tensor], clip_size: int = 224) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Crop each box -> resize -> CLIP vision encode -> project to hidden_dim
+        Returns padded region_feat [B,R,H], region_mask [B,R]
+        """
+        B = raw_images.size(0)
+        device = raw_images.device
+
+        max_regions = self.detector_topk
+        region_feat = raw_images.new_zeros((B, max_regions, self.hidden_dim))
+        region_mask = torch.zeros((B, max_regions), device=device, dtype=torch.long)
+
+        # collect all crops in one batch for speed
+        crops: List[torch.Tensor] = []
+        index_map: List[Tuple[int, int]] = []  # (b, slot)
+
+        for b in range(B):
+            img = raw_images[b]  # [3,H,W]
+            _, H, W = img.shape
+            boxes = boxes_list[b]
+            if boxes.numel() == 0:
+                continue
+
+            slot = 0
+            for box in boxes:
+                if slot >= max_regions:
+                    break
+                x1, y1, x2, y2 = box.round().long().tolist()
+                x1 = max(0, min(x1, W - 1))
+                x2 = max(0, min(x2, W))
+                y1 = max(0, min(y1, H - 1))
+                y2 = max(0, min(y2, H))
+                if x2 <= x1 + 1 or y2 <= y1 + 1:
+                    continue
+
+                crop = img[:, y1:y2, x1:x2]  # [3,h,w]
+                crop = crop.unsqueeze(0)
+                crop = F.interpolate(crop, size=(clip_size, clip_size), mode="bilinear", align_corners=False).squeeze(0)
+                crop = crop.clamp(0.0, 1.0)
+                crop = self._clip_normalize(crop)
+                crops.append(crop)
+                index_map.append((b, slot))
+                slot += 1
+
+        if len(crops) == 0:
+            # fallback: at least keep a dummy token to avoid NaNs
+            dummy = raw_images.new_zeros((B, 1, self.hidden_dim))
+            mask = torch.ones((B, 1), device=device, dtype=torch.long)
+            return dummy, mask
+
+        pixel_values = torch.stack(crops, dim=0)  # [M,3,224,224]
+        vision_out = self.clip.vision_model(pixel_values=pixel_values)
+
+        # get per-region embedding
+        if hasattr(vision_out, "pooler_output") and vision_out.pooler_output is not None:
+            reg = vision_out.pooler_output  # [M, vision_dim]
+        else:
+            reg = vision_out.last_hidden_state[:, 0, :]  # CLS
+
+        reg = self.vision_proj(reg)  # [M, hidden_dim]
+
+        # scatter back
+        for i, (b, slot) in enumerate(index_map):
+            region_feat[b, slot] = reg[i]
+            region_mask[b, slot] = 1
+
+        return region_feat, region_mask
+
+    @torch.no_grad()
+    def _encode_global_with_clip(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        image_tensor: [B,3,224,224] normalized by CLIPProcessor (already)
+        returns: [B,1,H]
+        """
+        out = self.clip.vision_model(pixel_values=image_tensor)
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            g = out.pooler_output
+        else:
+            g = out.last_hidden_state[:, 0, :]
+        g = self.vision_proj(g).unsqueeze(1)
+        return g
+
+    def forward(self, image_tensor: Optional[torch.Tensor], raw_images: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return region_feat, region_mask based on region_mode.
+        """
+        if self.region_mode == "detector_regions":
+            if raw_images is None:
+                raise ValueError("region_mode=detector_regions requires raw_images (B,3,H,W) float in [0,1].")
+            boxes_list = self._detect_boxes(raw_images)
+            reg_feat, reg_mask = self._encode_regions_with_clip(raw_images, boxes_list, clip_size=224)
+
+            if self.region_add_global:
+                if image_tensor is None:
+                    raise ValueError("region_add_global=True requires image_tensor (CLIP pixel_values).")
+                g = self._encode_global_with_clip(image_tensor)  # [B,1,H]
+                reg_feat = torch.cat([g, reg_feat], dim=1)
+                reg_mask = torch.cat([torch.ones((reg_mask.size(0), 1), device=reg_mask.device, dtype=reg_mask.dtype), reg_mask], dim=1)
+            return reg_feat, reg_mask
+
+        # default: your original CLIP patch tokens
+        if image_tensor is None:
+            # keep a dummy token
+            B = 1 if raw_images is None else raw_images.size(0)
+            device = torch.device("cpu") if raw_images is None else raw_images.device
+            dummy = torch.zeros((B, 1, self.hidden_dim), device=device)
+            mask = torch.ones((B, 1), device=device, dtype=torch.long)
+            return dummy, mask
+
+        with torch.no_grad():
+            vision_output = self.clip.vision_model(pixel_values=image_tensor)
+        patches = vision_output.last_hidden_state[:, 1:, :]  # [B,P,vision_dim]
+        reg_feat = self.vision_proj(patches)
+        reg_mask = torch.ones(reg_feat.size()[:2], device=reg_feat.device, dtype=torch.long)
+
+        if self.region_add_global:
+            g = self._encode_global_with_clip(image_tensor)  # [B,1,H]
+            reg_feat = torch.cat([g, reg_feat], dim=1)
+            reg_mask = torch.cat([torch.ones((reg_mask.size(0), 1), device=reg_mask.device, dtype=reg_mask.dtype), reg_mask], dim=1)
+
+        return reg_feat, reg_mask
+
+
+# -----------------------------
+# Query modules
+# -----------------------------
 class TypeQueryGenerator(nn.Module):
     def __init__(self, text_encoder, tokenizer, type_names: List[str]):
         super().__init__()
@@ -133,6 +409,7 @@ class QueryGuidedFusion(nn.Module):
         key_padding_text = (text_mask == 0)
         key_padding_reg = (region_mask == 0) if region_mask is not None else None
 
+        attn_weights = None
         for layer in self.layers:
             q1, _ = layer['q2t'](queries, text_feat, text_feat, key_padding_mask=key_padding_text)
             queries = layer['norm_q'](queries + q1)
@@ -155,6 +432,7 @@ class QueryGuidedFusion(nn.Module):
         if key_padding_reg is not None:
             attn_r = attn_r.masked_fill(key_padding_reg.unsqueeze(1), float("-inf"))
         agg_r = torch.matmul(F.softmax(attn_r, dim=-1), region_feat)
+
         gate_input = torch.cat([agg_t, agg_r], dim=-1)
         alpha = self.gate(gate_input)
         fused = alpha * agg_r + (1 - alpha) * agg_t
@@ -214,6 +492,9 @@ class ExistenceHead(nn.Module):
         return self.mlp(x).squeeze(-1)
 
 
+# -----------------------------
+# MQSPN Model
+# -----------------------------
 class MQSPNModel(nn.Module):
     def __init__(self, config, tokenizer, type_names):
         super().__init__()
@@ -234,19 +515,27 @@ class MQSPNModel(nn.Module):
             self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
         self.hidden_dim = self.text_encoder.config.hidden_size
 
+        self.tokenizer = tokenizer
+        self.type_names = type_names
+
         if self.use_image:
             v_path = _resolve_path(self.script_dir, config.image_encoder)
             self.clip = CLIPModel.from_pretrained(v_path, local_files_only=True)
             for p in self.clip.parameters():
                 p.requires_grad = False
+
             vision_dim = self.clip.vision_model.config.hidden_size
             self.vision_proj = nn.Sequential(
                 nn.Linear(vision_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
             )
-
-        self.tokenizer = tokenizer
-        self.type_names = type_names
+            self.region_extractor = VisionRegionExtractor(
+                clip=self.clip,
+                vision_proj=self.vision_proj,
+                hidden_dim=self.hidden_dim,
+                config=config,
+                script_dir=self.script_dir,
+            )
 
         self.type_query_gen = TypeQueryGenerator(self.text_encoder, tokenizer, type_names)
         self.mqs = MultiGrainedQuerySet(self.hidden_dim, self.num_types, self.slots_per_type)
@@ -256,21 +545,25 @@ class MQSPNModel(nn.Module):
         self.exist_head = ExistenceHead(self.hidden_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    def _get_region_feat(self, image_tensor):
-        with torch.no_grad():
-            vision_output = self.clip.vision_model(pixel_values=image_tensor)
-        patches = vision_output.last_hidden_state[:, 1:, :]
-        region_feat = self.vision_proj(patches)
-        region_mask = torch.ones(region_feat.size()[:2], device=region_feat.device, dtype=torch.long)
-        return region_feat, region_mask
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        image_tensor=None,
+        targets: Optional[List[List[EntityTarget]]] = None,
+        labels=None,
+        decode_thr=0.1,
+        **kwargs,
+    ):
+        # raw_images for detector: [B,3,H,W] float in [0,1]
+        raw_images = kwargs.get("raw_images", None)
 
-    def forward(self, input_ids, attention_mask, image_tensor=None, targets: Optional[List[List[EntityTarget]]] = None, labels=None, decode_thr=0.1):
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         text_feat = self.dropout(text_out)
         B, L, H = text_feat.shape
 
-        if self.use_image and image_tensor is not None:
-            region_feat, region_mask = self._get_region_feat(image_tensor)
+        if self.use_image and (image_tensor is not None or raw_images is not None):
+            region_feat, region_mask = self.region_extractor(image_tensor=image_tensor, raw_images=raw_images)
         else:
             region_feat = torch.zeros(B, 1, H, device=text_feat.device)
             region_mask = torch.ones(B, 1, device=text_feat.device, dtype=torch.long)
@@ -405,6 +698,9 @@ class MQSPNModel(nn.Module):
         return out
 
 
+# -----------------------------
+# CRF NER Model
+# -----------------------------
 class CRFNERModel(nn.Module):
     def __init__(self, config, tokenizer, label_mapping):
         super().__init__()
@@ -432,6 +728,13 @@ class CRFNERModel(nn.Module):
                 nn.Linear(vision_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
             )
+            self.region_extractor = VisionRegionExtractor(
+                clip=self.clip,
+                vision_proj=self.vision_proj,
+                hidden_dim=self.hidden_dim,
+                config=config,
+                script_dir=self.script_dir,
+            )
             self.fusion = nn.MultiheadAttention(self.hidden_dim, num_heads=8, dropout=self.dropout_rate, batch_first=True)
             self.fusion_norm = nn.LayerNorm(self.hidden_dim)
 
@@ -439,20 +742,16 @@ class CRFNERModel(nn.Module):
         self.classifier = nn.Linear(self.hidden_dim, self.num_labels)
         self.crf = CRF(self.num_labels, batch_first=True)
 
-    def _get_region_feat(self, image_tensor):
-        with torch.no_grad():
-            vision_output = self.clip.vision_model(pixel_values=image_tensor)
-        patches = vision_output.last_hidden_state[:, 1:, :]
-        region_feat = self.vision_proj(patches)
-        return region_feat
-
     def forward(self, input_ids, attention_mask, image_tensor=None, labels=None, **kwargs):
+        raw_images = kwargs.get("raw_images", None)
+
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         text_feat = self.dropout(text_out)
 
-        if self.use_image and image_tensor is not None:
-            region_feat = self._get_region_feat(image_tensor)
-            fused, _ = self.fusion(text_feat, region_feat, region_feat)
+        if self.use_image and (image_tensor is not None or raw_images is not None):
+            region_feat, region_mask = self.region_extractor(image_tensor=image_tensor, raw_images=raw_images)
+            # attention uses region_feat only; region_mask is handled inside Q/K softmax by -inf masking if you want.
+            fused, _ = self.fusion(text_feat, region_feat, region_feat, key_padding_mask=(region_mask == 0))
             text_feat = self.fusion_norm(text_feat + fused)
 
         emissions = self.classifier(text_feat)
@@ -466,6 +765,9 @@ class CRFNERModel(nn.Module):
             return pred_tags
 
 
+# -----------------------------
+# MQSPN Original Model
+# -----------------------------
 class MQSPNOriginalModel(nn.Module):
     def __init__(self, config, tokenizer, type_names, label_mapping=None):
         super().__init__()
@@ -485,6 +787,9 @@ class MQSPNOriginalModel(nn.Module):
             self.text_encoder = BertModel.from_pretrained(t_path, local_files_only=True)
         self.hidden_dim = self.text_encoder.config.hidden_size
 
+        self.tokenizer = tokenizer
+        self.type_names = type_names
+
         if self.use_image:
             v_path = _resolve_path(self.script_dir, config.image_encoder)
             self.clip = CLIPModel.from_pretrained(v_path, local_files_only=True)
@@ -495,9 +800,13 @@ class MQSPNOriginalModel(nn.Module):
                 nn.Linear(vision_dim, self.hidden_dim),
                 nn.LayerNorm(self.hidden_dim),
             )
-
-        self.tokenizer = tokenizer
-        self.type_names = type_names
+            self.region_extractor = VisionRegionExtractor(
+                clip=self.clip,
+                vision_proj=self.vision_proj,
+                hidden_dim=self.hidden_dim,
+                config=config,
+                script_dir=self.script_dir,
+            )
 
         self.type_query_gen = TypeQueryGenerator(self.text_encoder, tokenizer, type_names)
         self.mqs = MultiGrainedQuerySet(self.hidden_dim, self.num_types, self.slots_per_type)
@@ -519,21 +828,15 @@ class MQSPNOriginalModel(nn.Module):
             self.region_head = RegionMatchHead(self.hidden_dim)
             self.exist_head = ExistenceHead(self.hidden_dim)
 
-    def _get_region_feat(self, image_tensor):
-        with torch.no_grad():
-            vision_output = self.clip.vision_model(pixel_values=image_tensor)
-        patches = vision_output.last_hidden_state[:, 1:, :]
-        region_feat = self.vision_proj(patches)
-        region_mask = torch.ones(region_feat.size()[:2], device=region_feat.device, dtype=torch.long)
-        return region_feat, region_mask
+    def forward(self, input_ids, attention_mask, image_tensor=None, targets=None, labels=None, decode_thr=0.1, **kwargs):
+        raw_images = kwargs.get("raw_images", None)
 
-    def forward(self, input_ids, attention_mask, image_tensor=None, targets=None, labels=None, decode_thr=0.1):
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         text_feat = self.dropout(text_out)
         B, L, H = text_feat.shape
 
-        if self.use_image and image_tensor is not None:
-            region_feat, region_mask = self._get_region_feat(image_tensor)
+        if self.use_image and (image_tensor is not None or raw_images is not None):
+            region_feat, region_mask = self.region_extractor(image_tensor=image_tensor, raw_images=raw_images)
         else:
             region_feat = torch.zeros(B, 1, H, device=text_feat.device)
             region_mask = torch.ones(B, 1, device=text_feat.device, dtype=torch.long)
@@ -665,6 +968,9 @@ class MQSPNOriginalModel(nn.Module):
         return out
 
 
+# -----------------------------
+# build_model
+# -----------------------------
 def build_model(config, tokenizer=None, type_names=None, label_mapping=None):
     model_name = getattr(config, 'model', 'mqspn')
     if model_name == 'crf':

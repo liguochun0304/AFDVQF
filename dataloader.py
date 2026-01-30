@@ -16,6 +16,7 @@ from PIL import Image
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import torchvision.transforms.functional as TF
 from transformers import BertTokenizer
 from transformers import RobertaTokenizer, CLIPProcessor
 from model import _resolve_path, EntityTarget
@@ -293,8 +294,18 @@ class MMPNERProcessor(object):
 
 
 class MMPNERDataset(Dataset):
-    def __init__(self, processor, transform, img_path=None, max_seq=40, sample_ratio=1, mode='train',
-                 ignore_idx=0, set_prediction=False):
+    def __init__(
+        self,
+        processor,
+        transform=None,
+        img_path=None,
+        max_seq=40,
+        sample_ratio=1,
+        mode='train',
+        ignore_idx=0,
+        set_prediction=False,
+        clip_processor: CLIPProcessor = None,
+    ):
         self.processor = processor
         self.transform = transform
         self.data_dict = processor.load_from_file(mode, sample_ratio)
@@ -308,6 +319,7 @@ class MMPNERDataset(Dataset):
         self.sample_ratio = sample_ratio
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.set_prediction = set_prediction
+        self.clip_processor = clip_processor
         self.type_names = get_entity_type_names(self.label_mapping)
         self.type_name2id = {t: i for i, t in enumerate(self.type_names)}
 
@@ -360,65 +372,108 @@ class MMPNERDataset(Dataset):
             norm_label_ids = normalize_labels_for_spans(label_ids_list, self.id2tag, self.label_mapping)
             targets = bio_to_spans(norm_label_ids, self.id2tag, self.type_name2id)
 
+        raw_image = None
+        image_tensor = None
         if self.img_path is not None:
             try:
                 img_path = os.path.join(self.img_path, img)
-                image = Image.open(img_path).convert('RGB')
-                image = self.transform(image)
-            except:
+                img_pil = Image.open(img_path).convert('RGB')
+            except Exception:
                 img_path = os.path.join("/root/autodl-fs", "data", "no_images.jpg")
                 if not os.path.exists(img_path):
                     img_path = os.path.join(self.script_dir, 'data', 'no_images.jpg')
-                image = Image.open(img_path).convert('RGB')
-                image = self.transform(image)
+                img_pil = Image.open(img_path).convert('RGB')
 
-            if self.set_prediction:
-                return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "image": image, "targets": targets}
-            return input_ids, attention_mask, labels, image
+            raw_image = TF.to_tensor(img_pil)  # float32, [0,1]
+
+            if self.clip_processor is not None:
+                clip_out = self.clip_processor(images=img_pil, return_tensors="pt")
+                image_tensor = clip_out["pixel_values"].squeeze(0)
+            elif self.transform is not None:
+                image_tensor = self.transform(img_pil)
 
         if self.set_prediction:
-            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "targets": targets}
-        return input_ids, attention_mask, labels
+            out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "targets": targets}
+        else:
+            out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+        if image_tensor is not None:
+            out["image_tensor"] = image_tensor
+        if raw_image is not None:
+            out["raw_image"] = raw_image
+
+        return out
 
 def collate_fn(batch):
     if isinstance(batch[0], dict):
-        has_image = "image" in batch[0]
         has_targets = "targets" in batch[0]
+        has_labels = "labels" in batch[0]
+        has_image_tensor = "image_tensor" in batch[0]
+
         input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
         attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
-        labels = torch.stack([b["labels"] for b in batch], dim=0)
         out = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "labels": labels,
         }
-        if has_image:
-            images = torch.stack([b["image"] for b in batch], dim=0)
-            out["image"] = images
+
+        if has_labels:
+            out["labels"] = torch.stack([b["labels"] for b in batch], dim=0)
+        if has_image_tensor:
+            image_tensor = torch.stack([b["image_tensor"] for b in batch], dim=0)
+            out["image_tensor"] = image_tensor
+
+        # pad raw_images to same H/W
+        raw_list = [b.get("raw_image", None) for b in batch]
+        has_raw = any(r is not None for r in raw_list)
+        if has_raw:
+            raw_list = [r if r is not None else torch.zeros(3, 1, 1) for r in raw_list]
+            max_h = max(r.shape[1] for r in raw_list)
+            max_w = max(r.shape[2] for r in raw_list)
+            raw_images = torch.zeros(len(batch), 3, max_h, max_w, dtype=raw_list[0].dtype)
+            for i, r in enumerate(raw_list):
+                _, h, w = r.shape
+                raw_images[i, :, :h, :w] = r
+            out["raw_images"] = raw_images
+        else:
+            out["raw_images"] = None
+
         if has_targets:
             out["targets"] = [b["targets"] for b in batch]
         return out
+
+    # tuple fallback (rare)
+    if len(batch[0]) == 3:
+        input_ids, attention_mask, labels = zip(*batch)
+        images = None
+        raw_imgs = None
+    elif len(batch[0]) == 4:
+        input_ids, attention_mask, labels, images = zip(*batch)
+        raw_imgs = None
+    elif len(batch[0]) == 5:
+        input_ids, attention_mask, labels, images, raw_imgs = zip(*batch)
     else:
-        if len(batch[0]) == 3:
-            input_ids, attention_mask, labels = zip(*batch)
-            has_image = False
-        elif len(batch[0]) == 4:
-            input_ids, attention_mask, labels, images = zip(*batch)
-            has_image = True
-        else:
-            raise ValueError("Unexpected batch format")
-        input_ids = torch.stack(input_ids, dim=0)
-        attention_mask = torch.stack(attention_mask, dim=0)
-        labels = torch.stack(labels, dim=0)
-        out = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-        if has_image:
-            images = torch.stack(images, dim=0)
-            out["image"] = images
-        return out
+        raise ValueError("Unexpected batch format")
+
+    input_ids = torch.stack(input_ids, dim=0)
+    attention_mask = torch.stack(attention_mask, dim=0)
+    labels = torch.stack(labels, dim=0)
+    out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+    if images is not None:
+        out["image_tensor"] = torch.stack(images, dim=0)
+    if raw_imgs is not None:
+        raw_list = [r if r is not None else torch.zeros(3, 1, 1) for r in raw_imgs]
+        max_h = max(r.shape[1] for r in raw_list)
+        max_w = max(r.shape[2] for r in raw_list)
+        raw_images = torch.zeros(len(batch), 3, max_h, max_w, dtype=raw_list[0].dtype)
+        for i, r in enumerate(raw_list):
+            _, h, w = r.shape
+            raw_images[i, :, :h, :w] = r
+        out["raw_images"] = raw_images
+    else:
+        out["raw_images"] = None
+    return out
 
 
 if __name__ == '__main__':

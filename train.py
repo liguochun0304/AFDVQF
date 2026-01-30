@@ -15,10 +15,10 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from tqdm import tqdm
-from transformers import get_linear_schedule_with_warmup
+from transformers import get_linear_schedule_with_warmup, CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from model import MQSPNModel, CRFNERModel, MQSPNOriginalModel, build_model
+from model import MQSPNModel, CRFNERModel, MQSPNOriginalModel, build_model, _resolve_path
 from test import evaluate_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,10 +134,21 @@ def train(config):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])])
+    clip_processor = None
+    if config.use_image:
+        v_path = _resolve_path(script_dir, config.image_encoder)
+        clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
+
     processor = MMPNERProcessor(data_path, config.text_encoder)
     train_dataset = MMPNERDataset(
-        processor, transform, img_path=img_path, max_seq=config.max_len,
-        sample_ratio=1.0, mode='train', set_prediction=True
+        processor,
+        transform,
+        img_path=img_path,
+        max_seq=config.max_len,
+        sample_ratio=1.0,
+        mode='train',
+        set_prediction=True,
+        clip_processor=clip_processor,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -153,7 +164,8 @@ def train(config):
         max_seq=config.max_len,
         sample_ratio=1.0,
         mode='valid',
-        set_prediction=True
+        set_prediction=True,
+        clip_processor=clip_processor,
     )
 
     val_loader = DataLoader(
@@ -283,17 +295,32 @@ def train(config):
             # image_tensor = batch[3].to(device, non_blocking=True)
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                images = batch.get("image", None)
-                if images is not None:
-                    images = images.to(device)
+                image_tensor = batch.get("image_tensor", None)
+                raw_images = batch.get("raw_images", None)
+                if image_tensor is not None:
+                    image_tensor = image_tensor.to(device)
+                if raw_images is not None:
+                    raw_images = raw_images.to(device)
 
                 use_crf_train = (getattr(config, 'model', 'mqspn') == 'crf') or (getattr(config, 'model') == 'mqspn_original' and getattr(config, 'decoder_type', 'span') == 'crf')
                 if use_crf_train:
                     labels = batch["labels"].to(device)
-                    loss = model(input_ids, attention_mask, image_tensor=images, labels=labels)
+                    loss = model(
+                        input_ids,
+                        attention_mask,
+                        image_tensor=image_tensor,
+                        raw_images=raw_images,
+                        labels=labels,
+                    )
                 else:
                     targets = batch.get("targets", None)
-                    loss = model(input_ids, attention_mask, image_tensor=images, targets=targets)
+                    loss = model(
+                        input_ids,
+                        attention_mask,
+                        image_tensor=image_tensor,
+                        raw_images=raw_images,
+                        targets=targets,
+                    )
                     if random.random() < 0.01:
                         print(f"loss_span={getattr(model, 'last_loss_span', None)} loss_region={getattr(model, 'last_loss_region', None)} loss_exist={getattr(model, 'last_loss_exist', None)}")
 
