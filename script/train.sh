@@ -14,7 +14,7 @@ LOG_FILE="$LOG_DIR/train_${STAMP}.log"
 # Default hyper-params (feel free to tweak)
 # -----------------------------
 DEVICE="cuda:0"
-DATASET="twitter2017"          # twitter2015 | twitter2017 | NewsMKG
+DATASET="twitter2015"          # twitter2015 | twitter2017 | NewsMKG
 TEXT_ENCODER="bert"           # path or alias resolved in code
 IMAGE_ENCODER="clip-patch32"  # path or alias resolved in code
 REGION_MODE="detector_regions"  # clip_patches | detector_regions
