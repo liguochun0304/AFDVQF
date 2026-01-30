@@ -18,8 +18,8 @@ from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup, CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from model import MQSPNModel, CRFNERModel, MQSPNOriginalModel, build_model, _resolve_path
-from test import evaluate_model
+from model import MQSPNDetCRF, _resolve_path
+from test import evaluate_crf_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 STORAGE_ROOT = "/root/autodl-fs"
@@ -147,7 +147,6 @@ def train(config):
         max_seq=config.max_len,
         sample_ratio=1.0,
         mode='train',
-        set_prediction=True,
         clip_processor=clip_processor,
     )
     train_loader = DataLoader(
@@ -164,7 +163,6 @@ def train(config):
         max_seq=config.max_len,
         sample_ratio=1.0,
         mode='valid',
-        set_prediction=True,
         clip_processor=clip_processor,
     )
 
@@ -185,13 +183,7 @@ def train(config):
     start_epoch = 0
     best_f1 = 0.0
     
-    model_name = getattr(config, 'model', 'mqspn')
-    if model_name == 'crf':
-        model = CRFNERModel(config, tokenizer=tokenizer, label_mapping=train_dataset.label_mapping).to(device)
-    elif model_name == 'mqspn_original':
-        model = MQSPNOriginalModel(config, tokenizer=tokenizer, type_names=type_names, label_mapping=train_dataset.label_mapping).to(device)
-    else:
-        model = MQSPNModel(config, tokenizer=tokenizer, type_names=type_names).to(device)
+    model = MQSPNDetCRF(config, tokenizer=tokenizer, label_mapping=train_dataset.label_mapping).to(device)
     
     if config.continue_train_name != "None":
         SAVE_ROOT = os.path.join(STORAGE_ROOT, "save_models")
@@ -302,27 +294,14 @@ def train(config):
                 if raw_images is not None:
                     raw_images = raw_images.to(device)
 
-                use_crf_train = (getattr(config, 'model', 'mqspn') == 'crf') or (getattr(config, 'model') == 'mqspn_original' and getattr(config, 'decoder_type', 'span') == 'crf')
-                if use_crf_train:
-                    labels = batch["labels"].to(device)
-                    loss = model(
-                        input_ids,
-                        attention_mask,
-                        image_tensor=image_tensor,
-                        raw_images=raw_images,
-                        labels=labels,
-                    )
-                else:
-                    targets = batch.get("targets", None)
-                    loss = model(
-                        input_ids,
-                        attention_mask,
-                        image_tensor=image_tensor,
-                        raw_images=raw_images,
-                        targets=targets,
-                    )
-                    if random.random() < 0.01:
-                        print(f"loss_span={getattr(model, 'last_loss_span', None)} loss_region={getattr(model, 'last_loss_region', None)} loss_exist={getattr(model, 'last_loss_exist', None)}")
+                labels = batch["labels"].to(device)
+                loss = model(
+                    input_ids,
+                    attention_mask,
+                    image_tensor=image_tensor,
+                    raw_images=raw_images,
+                    labels=labels,
+                )
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -355,19 +334,9 @@ def train(config):
             writer.add_scalar("train/loss", avg_loss, epoch)
             print("\n✅ Epoch {0} Train Loss: {1:.4f}".format(epoch, avg_loss))
 
-            use_crf_eval = (model_name == 'crf') or (model_name == 'mqspn_original' and getattr(config, 'decoder_type', 'span') == 'crf')
-            if use_crf_eval:
-                from test import evaluate_crf_model
-                acc, f1, p, r = evaluate_crf_model(
-                    model, val_loader, device, train_dataset.label_mapping, type_names=type_names
-                )
-            else:
-                acc, f1, p, r = evaluate_model(
-                    model, val_loader, device, train_dataset.label_mapping,
-                    type_names=type_names,
-                    label_mapping=train_dataset.label_mapping,
-                    decode_thr=0.1
-                )
+            acc, f1, p, r = evaluate_crf_model(
+                model, val_loader, device, train_dataset.label_mapping, type_names=type_names
+            )
             print(
                 "🎯Epoch {0} Eval F1: {1:.4f} precision: {2:.4f} recall: {3:.4f} acc:{4:.4f}".format(epoch, f1, p, r, acc))
             writer.add_scalar("eval/f1", f1, epoch)

@@ -33,25 +33,16 @@ def get_config():
 
     parser.add_argument('--use_image', action='store_true')
 
-    parser.add_argument("--model", type=str, default="mqspn")
-    parser.add_argument("--decoder_type", type=str, default="span")
-
     parser.add_argument("--continue_train_name", type=str, default="None")
 
     parser.add_argument("--slots_per_type", type=int, default=15)
     parser.add_argument("--qfnet_layers", type=int, default=2)
-    parser.add_argument("--loss_w_span", type=float, default=1.0)
-    parser.add_argument("--loss_w_exist", type=float, default=0.5)
+    parser.add_argument("--qfnet_heads", type=int, default=8)
+    parser.add_argument("--num_patch_tokens", type=int, default=16)
 
     # -----------------------------
     # NEW: vision region settings
     # -----------------------------
-    # region_mode:
-    #   - clip_patches: 你现在的默认做法（CLIP patch tokens）
-    #   - detector_regions: Faster R-CNN 检测 box -> crop -> CLIP 编码 region
-    parser.add_argument("--region_mode", type=str, default="clip_patches",
-                        choices=["clip_patches", "detector_regions"])
-
     # torchvision / torch hub cache dir（会下载 Faster R-CNN 权重到这里）
     parser.add_argument("--torch_home", type=str, default="/root/autodl-fs/torch_cache")
 
@@ -62,10 +53,6 @@ def get_config():
                         help="检测置信度阈值")
     parser.add_argument("--detector_nms_iou", type=float, default=0.7,
                         help="NMS IoU 阈值")
-
-    # 可选：把全图 global token 拼到 region 序列最前面（建议开）
-    parser.add_argument("--region_add_global", action="store_true",
-                        help="在 region 序列前拼接一个全局图像 token")
 
     # 可选：离线环境用本地 detector 权重（.pth），否则用 torchvision 默认权重自动下载
     parser.add_argument("--detector_ckpt", type=str, default="",

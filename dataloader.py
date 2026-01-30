@@ -19,35 +19,11 @@ from torchvision import transforms
 import torchvision.transforms.functional as TF
 from transformers import BertTokenizer
 from transformers import RobertaTokenizer, CLIPProcessor
-from model import _resolve_path, EntityTarget
+from model import _resolve_path
 
 
 
 logger = logging.getLogger(__name__)
-
-
-def bio_to_spans(label_ids: List[int], id2tag: Dict[int, str], type_name2id: Dict[str, int]) -> List[EntityTarget]:
-    spans = []
-    i = 0
-    while i < len(label_ids):
-        tag = id2tag.get(label_ids[i], "O")
-        if tag.startswith("B-"):
-            etype = tag[2:]
-            start = i
-            end = i
-            i += 1
-            while i < len(label_ids):
-                next_tag = id2tag.get(label_ids[i], "O")
-                if next_tag == f"I-{etype}":
-                    end = i
-                    i += 1
-                else:
-                    break
-            if etype in type_name2id:
-                spans.append(EntityTarget(start=start, end=end, type_id=type_name2id[etype], region_id=-1))
-        else:
-            i += 1
-    return spans
 
 
 def get_entity_type_names(label_mapping: Dict[str, int]) -> List[str]:
@@ -57,99 +33,6 @@ def get_entity_type_names(label_mapping: Dict[str, int]) -> List[str]:
             types.add(lab[2:])
     return sorted(types)
 
-
-def normalize_labels_for_spans(
-    label_ids: List[int],
-    id2tag: Dict[int, str],
-    label2id: Dict[str, int],
-) -> List[int]:
-    """
-    将子词上的 X 还原为当前实体的 I-标签（仅当上一token为实体），
-    让 span 训练目标覆盖完整实体跨度。
-    """
-    out = []
-    current_entity_id = None
-    o_id = label2id.get("O", 0)
-
-    for lid in label_ids:
-        tag = id2tag.get(lid, "O")
-        if tag == "X":
-            if current_entity_id is not None:
-                out.append(current_entity_id)
-            else:
-                out.append(o_id)
-            continue
-
-        if tag.startswith("B-"):
-            out.append(lid)
-            etype = tag[2:]
-            i_tag = f"I-{etype}"
-            current_entity_id = label2id.get(i_tag, lid)
-            continue
-
-        if tag.startswith("I-"):
-            out.append(lid)
-            current_entity_id = lid
-            continue
-
-        # O / [CLS] / [SEP] / PAD 等：重置
-        out.append(lid)
-        current_entity_id = None
-
-    return out
-
-
-def spans_to_bio(spans: List[EntityTarget], seq_len: int, type_names: List[str], label_mapping: Dict[str, int], ignore_special: bool = True, valid_len: int = None) -> List[int]:
-    """
-    将实体列表转换回 BIO 序列
-    Args:
-        spans: 实体列表，每个实体包含 (start, end, type_id, region_id)
-        seq_len: 序列长度（包含 [CLS] 和 [SEP]）
-        type_names: 实体类型名称列表
-        label_mapping: 标签到 ID 的映射
-        ignore_special: 是否忽略 [CLS] 和 [SEP] 位置（默认 True，即从位置 1 开始）
-        valid_len: 有效序列长度（用于边界检查，如果为None则使用seq_len）
-    Returns:
-        BIO 标签序列（List[int]）
-    """
-    bio_seq = [label_mapping.get("O", 0)] * seq_len
-    if valid_len is None:
-        valid_len = seq_len
-    
-    for span in spans:
-        start, end = span.start, span.end
-        type_id = span.type_id
-        
-        if type_id < 0 or type_id >= len(type_names):
-            continue
-        
-        type_name = type_names[type_id]
-        b_tag = f"B-{type_name}"
-        i_tag = f"I-{type_name}"
-        
-        b_id = label_mapping.get(b_tag)
-        i_id = label_mapping.get(i_tag)
-        
-        if b_id is None or i_id is None:
-            continue
-        
-        if ignore_special:
-            if start < 1 or end < 1:
-                continue
-            max_pos = min(valid_len - 1, seq_len - 1)
-            if start > max_pos or end > max_pos:
-                continue
-        else:
-            if start < 0 or end < 0 or start >= seq_len or end >= seq_len:
-                continue
-        
-        if start <= end:
-            bio_seq[start] = b_id
-            for i in range(start + 1, end + 1):
-                if i < seq_len:
-                    bio_seq[i] = i_id
-    
-    return bio_seq
 
 class MMPNERProcessor(object):
     def __init__(self, data_path, bert_name):
@@ -303,7 +186,6 @@ class MMPNERDataset(Dataset):
         sample_ratio=1,
         mode='train',
         ignore_idx=0,
-        set_prediction=False,
         clip_processor: CLIPProcessor = None,
     ):
         self.processor = processor
@@ -318,10 +200,8 @@ class MMPNERDataset(Dataset):
         self.mode = mode
         self.sample_ratio = sample_ratio
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.set_prediction = set_prediction
         self.clip_processor = clip_processor
         self.type_names = get_entity_type_names(self.label_mapping)
-        self.type_name2id = {t: i for i, t in enumerate(self.type_names)}
 
         # 常用 id
         self.cls_id = self.label_mapping.get("[CLS]")
@@ -367,11 +247,6 @@ class MMPNERDataset(Dataset):
                  + [self.ignore_idx] * (self.max_seq - len(labels_exp) - 2)
         labels = torch.tensor(labels, dtype=torch.long)
 
-        if self.set_prediction:
-            label_ids_list = labels.tolist()
-            norm_label_ids = normalize_labels_for_spans(label_ids_list, self.id2tag, self.label_mapping)
-            targets = bio_to_spans(norm_label_ids, self.id2tag, self.type_name2id)
-
         raw_image = None
         image_tensor = None
         if self.img_path is not None:
@@ -392,10 +267,7 @@ class MMPNERDataset(Dataset):
             elif self.transform is not None:
                 image_tensor = self.transform(img_pil)
 
-        if self.set_prediction:
-            out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "targets": targets}
-        else:
-            out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
         if image_tensor is not None:
             out["image_tensor"] = image_tensor
@@ -406,7 +278,6 @@ class MMPNERDataset(Dataset):
 
 def collate_fn(batch):
     if isinstance(batch[0], dict):
-        has_targets = "targets" in batch[0]
         has_labels = "labels" in batch[0]
         has_image_tensor = "image_tensor" in batch[0]
 
@@ -438,8 +309,6 @@ def collate_fn(batch):
         else:
             out["raw_images"] = None
 
-        if has_targets:
-            out["targets"] = [b["targets"] for b in batch]
         return out
 
     # tuple fallback (rare)
@@ -512,7 +381,7 @@ if __name__ == '__main__':
     img_path = IMG_PATH['twitter15']
     processor = MMPNERProcessor(data_path, "bert")
     train_dataset = MMPNERDataset(processor, transform, img_path=img_path, max_seq=128,
-                                  sample_ratio=1.0, mode='train', set_prediction=True)
+                                  sample_ratio=1.0, mode='train')
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=2,
@@ -526,8 +395,6 @@ if __name__ == '__main__':
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
     labels = batch["labels"]
-    targets = batch.get("targets", [])
-
     id2tag = train_dataset.id2tag
     for b in range(input_ids.size(0)):
         valid_len = int(attention_mask[b].sum().item())
@@ -535,8 +402,6 @@ if __name__ == '__main__':
         toks = train_dataset.tokenizer.convert_ids_to_tokens(ids)
         labs = labels[b, :valid_len].tolist()
         lab_str = [id2tag.get(x, str(x)) for x in labs]
-        spans = [(t.start, t.end, train_dataset.type_names[t.type_id]) for t in (targets[b] if b < len(targets) else [])]
         print("tokens:", toks)
         print("labels:", lab_str)
-        print("spans:", spans)
         print("-" * 60)

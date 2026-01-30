@@ -1,10 +1,53 @@
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional
+import argparse
+import os
+
 import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from transformers import CLIPProcessor
 
-from dataloader import bio_to_spans, get_entity_type_names
+from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
+from metrics import get_chunks
+from model import MQSPNDetCRF, _resolve_path
 
-SpanTuple = Tuple[int, int, int]
-Chunk = Tuple[str, int, int]
+
+def _normalize_x_labels(
+    label_ids: List[int],
+    idx2tag: Dict[int, str],
+    label2id: Dict[str, int],
+) -> List[int]:
+    """Replace X tokens with the current I- tag if possible, else O."""
+    out: List[int] = []
+    current_entity_id = None
+    o_id = label2id.get("O", 0)
+
+    for lid in label_ids:
+        tag = idx2tag.get(lid, "O")
+        if tag == "X":
+            out.append(current_entity_id if current_entity_id is not None else o_id)
+            continue
+
+        if tag.startswith("B-"):
+            out.append(lid)
+            etype = tag[2:]
+            i_tag = f"I-{etype}"
+            current_entity_id = label2id.get(i_tag, lid)
+            continue
+
+        if tag.startswith("I-"):
+            out.append(lid)
+            current_entity_id = lid
+            continue
+
+        out.append(lid)
+        current_entity_id = None
+
+    return out
+
+
+def _chunks_from_seq(seq: List[int], label2id: Dict[str, int]) -> set:
+    return set(get_chunks(seq, label2id))
 
 
 def evaluate_crf_model(
@@ -17,14 +60,13 @@ def evaluate_crf_model(
 ) -> Tuple[float, float, float, float]:
     model.eval()
     idx2tag = {v: k for k, v in label_mapping.items()}
-    type_name2id = {name: i for i, name in enumerate(type_names)}
 
     correct = 0.0
     total_pred = 0.0
     total_gold = 0.0
     exact_flags = []
     type_stats = {t: [0, 0, 0] for t in type_names}
-    debug_samples: List[Tuple[List[str], List[str], List[SpanTuple], List[SpanTuple], List[Chunk], List[Chunk]]] = []
+    debug_samples = []
 
     with torch.inference_mode():
         for batch in val_loader:
@@ -53,27 +95,19 @@ def evaluate_crf_model(
                     continue
 
                 raw_pred = pred_tags_batch[i]
-                pred_seq = raw_pred[1:valid_len-1] if isinstance(raw_pred, list) else raw_pred[1:valid_len-1].cpu().tolist()
-                gold_seq = labels[i, 1:valid_len-1].cpu().tolist()
+                pred_seq = raw_pred[1:valid_len - 1] if isinstance(raw_pred, list) else raw_pred[1:valid_len - 1].cpu().tolist()
+                gold_seq = labels[i, 1:valid_len - 1].cpu().tolist()
 
-                pred_tag_strs = [idx2tag.get(tid, "O") for tid in pred_seq]
-                gold_tag_strs = [idx2tag.get(tid, "O") for tid in gold_seq]
+                pred_norm = _normalize_x_labels(pred_seq, idx2tag, label_mapping)
+                gold_norm = _normalize_x_labels(gold_seq, idx2tag, label_mapping)
 
-                pred_spans_ent = bio_to_spans(pred_seq, idx2tag, type_name2id)
-                gold_spans_ent = bio_to_spans(gold_seq, idx2tag, type_name2id)
+                pred_chunks = _chunks_from_seq(pred_norm, label_mapping)
+                gold_chunks = _chunks_from_seq(gold_norm, label_mapping)
 
-                pred_set = {(e.start, e.end, e.type_id) for e in pred_spans_ent}
-                gold_set = {(e.start, e.end, e.type_id) for e in gold_spans_ent}
-
-                pred_spans = [(e.start, e.end, e.type_id) for e in pred_spans_ent]
-                gold_spans = [(e.start, e.end, e.type_id) for e in gold_spans_ent]
-                pred_chunks = _spans_to_chunks(pred_spans, type_names)
-                gold_chunks = _spans_to_chunks(gold_spans, type_names)
-
-                correct += len(pred_set & gold_set)
-                total_pred += len(pred_set)
-                total_gold += len(gold_set)
-                exact_flags.append(1.0 if pred_set == gold_set else 0.0)
+                correct += len(pred_chunks & gold_chunks)
+                total_pred += len(pred_chunks)
+                total_gold += len(gold_chunks)
+                exact_flags.append(1.0 if pred_chunks == gold_chunks else 0.0)
 
                 for ent_type in type_names:
                     pset = {c for c in pred_chunks if c[0] == ent_type}
@@ -83,7 +117,9 @@ def evaluate_crf_model(
                     type_stats[ent_type][2] += len(gset)
 
                 if len(debug_samples) < debug_n:
-                    debug_samples.append((pred_tag_strs, gold_tag_strs, pred_spans, gold_spans, sorted(pred_chunks), sorted(gold_chunks)))
+                    pred_tag_strs = [idx2tag.get(tid, "O") for tid in pred_norm]
+                    gold_tag_strs = [idx2tag.get(tid, "O") for tid in gold_norm]
+                    debug_samples.append((pred_tag_strs, gold_tag_strs, sorted(pred_chunks), sorted(gold_chunks)))
 
     p = correct / total_pred if total_pred > 0 else 0.0
     r = correct / total_gold if total_gold > 0 else 0.0
@@ -91,16 +127,12 @@ def evaluate_crf_model(
     acc = float(sum(exact_flags) / len(exact_flags)) if exact_flags else 0.0
 
     print("=" * 60)
-    print("CRF decode 评估 (BIO tag → spans)")
+    print("CRF decode 评估 (BIO chunks)")
     print("=" * 60)
-    for i, (pred_tags, gold_tags, ps, gs, pc, gc) in enumerate(debug_samples, 1):
-        ps_str = [(s, e, type_names[t]) for s, e, t in ps]
-        gs_str = [(s, e, type_names[t]) for s, e, t in gs]
+    for i, (pred_tags, gold_tags, pc, gc) in enumerate(debug_samples, 1):
         print(f"\n样本 {i}:")
         print(f"  预测 tag序列: {pred_tags}")
         print(f"  真实 tag序列: {gold_tags}")
-        print(f"  预测 spans: {ps_str}")
-        print(f"  真实 spans: {gs_str}")
         print(f"  预测 chunks: {pc}")
         print(f"  真实 chunks: {gc}")
 
@@ -116,301 +148,116 @@ def evaluate_crf_model(
     return acc, f1, p, r
 
 
-def _reverse_map(label2id: Dict[str, int]) -> Dict[int, str]:
-    return {v: k for k, v in label2id.items()}
+def _build_data_paths(storage_root: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
+    data_root = os.path.join(storage_root, "data")
+    data_path = {
+        "twitter2015": {
+            "train": os.path.join(data_root, "twitter2015/train.txt"),
+            "valid": os.path.join(data_root, "twitter2015/valid.txt"),
+            "test": os.path.join(data_root, "twitter2015/test.txt"),
+        },
+        "twitter2017": {
+            "train": os.path.join(data_root, "twitter2017/train.txt"),
+            "valid": os.path.join(data_root, "twitter2017/valid.txt"),
+            "test": os.path.join(data_root, "twitter2017/test.txt"),
+        },
+        "NewsMKG": {
+            "train": os.path.join(data_root, "NewsMKG/train.txt"),
+            "valid": os.path.join(data_root, "NewsMKG/valid.txt"),
+            "test": os.path.join(data_root, "NewsMKG/test.txt"),
+        }
+    }
+    img_path = {
+        "twitter2015": os.path.join(data_root, "twitter2015/twitter2015_images"),
+        "twitter2017": os.path.join(data_root, "twitter2017/twitter2017_images"),
+        "NewsMKG": os.path.join(data_root, "NewsMKG"),
+    }
+    return data_path, img_path
 
 
-def _get_label2id(label2id=None, tags=None, label_mapping=None) -> Dict[str, int]:
-    # 兼容你历史调用
-    if label_mapping is not None:
-        return label_mapping
-    if label2id is not None:
-        return label2id
-    if tags is not None:
-        return tags
-    raise ValueError("evaluate_model 需要提供 label2id / tags / label_mapping 之一")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--max_len", type=int, default=128)
+    parser.add_argument("--dataset_name", type=str, default="twitter2017")
+    parser.add_argument("--text_encoder", type=str, default="chinese-roberta-www-ext")
+    parser.add_argument("--image_encoder", type=str, default="clip-patch32")
+    parser.add_argument("--use_image", action="store_true")
+    parser.add_argument("--ckpt_dir", type=str, required=True)
+    parser.add_argument("--split", type=str, default="test", choices=["valid", "test"])
+    parser.add_argument("--torch_home", type=str, default="/root/autodl-fs/torch_cache")
+    parser.add_argument("--detector_topk", type=int, default=10)
+    parser.add_argument("--detector_score_thr", type=float, default=0.2)
+    parser.add_argument("--detector_nms_iou", type=float, default=0.7)
+    parser.add_argument("--detector_ckpt", type=str, default="")
+    parser.add_argument("--slots_per_type", type=int, default=15)
+    parser.add_argument("--qfnet_layers", type=int, default=2)
+    parser.add_argument("--qfnet_heads", type=int, default=8)
+    parser.add_argument("--num_patch_tokens", type=int, default=16)
+    parser.add_argument("--drop_prob", type=float, default=0.25)
 
+    args = parser.parse_args()
 
-def _normalize_gold_labels_trimmed(
-    label_ids: List[int],
-    valid_len: int,
-    idx2tag: Dict[int, str],
-    ignore_to_O: set = {"X", "PAD"},
-) -> List[int]:
-    """
-    gold: 直接取 [1:valid_len-1]（去 CLS/SEP），并把 X/PAD 等当作 O（不改变长度，避免复杂坐标映射）
-    """
-    if valid_len <= 2:
-        return []
-    trimmed = label_ids[1: valid_len - 1]
-    out = []
-    for lid in trimmed:
-        tag = idx2tag.get(lid, "O")
-        if tag in ignore_to_O:
-            # 这里返回一个“等价于 O”的 id：如果 label2id 里有 O，建议用它；否则就保持原 lid
-            out.append(lid)  # 先占位，后面会统一映射 O（见 evaluate_predictions）
-        else:
-            out.append(lid)
-    return out
+    dev = args.device
+    if isinstance(dev, str) and (dev == "cuda" or dev.startswith("cuda")) and not torch.cuda.is_available():
+        dev = "cpu"
+    try:
+        device = torch.device(dev)
+    except Exception:
+        device = torch.device("cpu")
 
+    storage_root = "/root/autodl-fs"
+    data_path, img_path = _build_data_paths(storage_root)
 
-def _build_O_id(label2id: Dict[str, int]) -> int:
-    # 兜底：没有 O 就用 0
-    return label2id.get("O", 0)
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
+    clip_processor = None
+    if args.use_image:
+        v_path = _resolve_path(os.path.dirname(os.path.abspath(__file__)), args.image_encoder)
+        clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
 
-def _dedup_keep_best(pred_items: List[Tuple[int, int, int, float]]) -> List[SpanTuple]:
-    """
-    对同一个 (s,e,t) 只保留最高分。返回 (s,e,t)
-    """
-    best: Dict[Tuple[int, int, int], float] = {}
-    for s, e, t, score in pred_items:
-        key = (s, e, t)
-        if key not in best or score > best[key]:
-            best[key] = score
-    return [(s, e, t) for (s, e, t) in best.keys()]
-
-
-def _pred_to_trimmed_spans(
-    raw_pred_spans: Any,
-    valid_len: int,
-    num_types: int,
-    score_index: int = 4,
-    score_thr: Optional[float] = None,
-) -> List[SpanTuple]:
-    if not raw_pred_spans or valid_len <= 2:
-        return []
-
-    trimmed_len = valid_len - 2
-    tmp: List[Tuple[int, int, int, float]] = []
-
-    for item in raw_pred_spans:
-        if not isinstance(item, (tuple, list)) or len(item) < 3:
-            continue
-        s, e, t = int(item[0]), int(item[1]), int(item[2])
-        score = float(item[score_index]) if len(item) > score_index else 1.0
-
-        if score_thr is not None and score < score_thr:
-            continue
-        if s > e:
-            continue
-        if not (0 <= t < num_types):
-            continue
-        if not (1 <= s < valid_len - 1 and 1 <= e < valid_len - 1):
-            continue
-
-        s2, e2 = s - 1, e - 1
-        if not (0 <= s2 < trimmed_len and 0 <= e2 < trimmed_len):
-            continue
-
-        tmp.append((s2, e2, t, score))
-
-    return _dedup_keep_best(tmp)
-
-
-def _spans_to_chunks(spans: List[SpanTuple], type_names: List[str]) -> set:
-    out = set()
-    for s, e, t in spans:
-        if 0 <= t < len(type_names):
-            out.add((type_names[t], s, e + 1))  # end exclusive
-    return out
-
-
-def evaluate_predictions(
-    preds_per_sample: List[Any],
-    labels_per_sample: List[List[int]],
-    masks_per_sample: List[List[int]],
-    label2id: Dict[str, int],
-    type_names: List[str],
-    debug_n: int = 3,
-    score_thr: Optional[float] = None,
-    score_index: int = 4,
-) -> Tuple[float, float, float, float]:
-    """
-    输出保持不变：(acc, f1, p, r)
-      - acc：ExactMatchAcc（pred_chunks == gold_chunks 的比例）
-      - p/r/f1：micro span-level
-    """
-    idx2tag = _reverse_map(label2id)
-    type_name2id = {name: i for i, name in enumerate(type_names)}
-    o_id = _build_O_id(label2id)
-
-    correct = 0.0
-    total_pred = 0.0
-    total_gold = 0.0
-    exact_flags: List[float] = []
-
-    type_stats = {t: [0.0, 0.0, 0.0] for t in type_names}  # cp,tp,tc
-    debug_samples = []
-
-    for raw_pred, label_ids, mask in zip(preds_per_sample, labels_per_sample, masks_per_sample):
-        valid_len = int(sum(mask))
-        if valid_len <= 2:
-            pred_chunks = set()
-            gold_chunks = set()
-            exact_flags.append(1.0)
-            _sample_idx += 1
-            continue
-
-        gold_trimmed = label_ids[:valid_len][1:valid_len - 1]
-        gold_norm = []
-        current_entity_id = None
-        for lid in gold_trimmed:
-            tag = idx2tag.get(lid, "O")
-            if tag in {"X", "PAD"}:
-                if current_entity_id is not None:
-                    gold_norm.append(current_entity_id)
-                else:
-                    gold_norm.append(o_id)
-            elif tag.startswith("B-"):
-                gold_norm.append(lid)
-                etype = tag[2:]
-                i_tag = f"I-{etype}"
-                current_entity_id = label2id.get(i_tag, lid)
-            elif tag.startswith("I-"):
-                gold_norm.append(lid)
-                current_entity_id = lid
-            else:
-                gold_norm.append(lid)
-                current_entity_id = None
-
-        gold_entities = bio_to_spans(gold_norm, idx2tag, type_name2id)
-        gold_spans: List[SpanTuple] = [(int(e.start), int(e.end), int(e.type_id)) for e in gold_entities]
-
-        pred_spans = _pred_to_trimmed_spans(
-            raw_pred_spans=raw_pred,
-            valid_len=valid_len,
-            num_types=len(type_names),
-            score_index=score_index,
-            score_thr=score_thr,
-        )
-
-        pred_chunks = _spans_to_chunks(pred_spans, type_names)
-        gold_chunks = _spans_to_chunks(gold_spans, type_names)
-
-        correct += len(pred_chunks & gold_chunks)
-        total_pred += len(pred_chunks)
-        total_gold += len(gold_chunks)
-        exact_flags.append(1.0 if pred_chunks == gold_chunks else 0.0)
-
-        for ent_type in type_names:
-            pset = {c for c in pred_chunks if c[0] == ent_type}
-            gset = {c for c in gold_chunks if c[0] == ent_type}
-            type_stats[ent_type][0] += len(pset & gset)
-            type_stats[ent_type][1] += len(pset)
-            type_stats[ent_type][2] += len(gset)
-
-        if len(debug_samples) < debug_n:
-            debug_samples.append((pred_spans, gold_spans, sorted(pred_chunks), sorted(gold_chunks)))
-
-    p = correct / total_pred if total_pred > 0 else 0.0
-    r = correct / total_gold if total_gold > 0 else 0.0
-    f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-    acc = float(sum(exact_flags) / len(exact_flags)) if exact_flags else 0.0
-
-    print("=" * 60)
-    print("Span decode 评估 (trimmed: remove CLS/SEP)")
-    print("=" * 60)
-    for i, (ps, gs, pc, gc) in enumerate(debug_samples, 1):
-        ps_str = [(s, e, type_names[t]) for s, e, t in ps]
-        gs_str = [(s, e, type_names[t]) for s, e, t in gs]
-        print(f"\n样本 {i}:")
-        print(f"  预测 spans: {ps_str}")
-        print(f"  真实 spans: {gs_str}")
-        print(f"  预测 chunks: {pc}")
-        print(f"  真实 chunks: {gc}")
-
-    print(f"\n总体: Acc(ExactMatch)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
-
-    print("\n按类别:")
-    for ent_type in type_names:
-        cp, tp, tc = type_stats[ent_type]
-        p_c = cp / tp if tp > 0 else 0.0
-        r_c = cp / tc if tc > 0 else 0.0
-        f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
-        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f}")
-
-    print("=" * 60)
-    return acc, f1, p, r
-
-
-def evaluate_model(
-    model,
-    val_loader,
-    device: torch.device,
-    label2id: Optional[Dict[str, int]] = None,
-    type_names: Optional[List[str]] = None,
-    tags: Optional[Dict[str, int]] = None,            # 兼容旧参数
-    label_mapping: Optional[Dict[str, int]] = None,   # 兼容旧参数
-    debug_n: int = 3,
-    score_thr: Optional[float] = None,
-    decode_thr: Optional[float] = None,
-) -> Tuple[float, float, float, float]:
-    """
-    保持你原先 I/O：返回 (acc, f1, p, r)
-    - acc: ExactMatchAcc
-    - p/r/f1: micro span-level
-    """
-    label2id = _get_label2id(label2id=label2id, tags=tags, label_mapping=label_mapping)
-    if type_names is None:
-        raise ValueError("evaluate_model 需要提供 type_names")
-
-    model.eval()
-
-    preds_all: List[Any] = []
-    labels_all: List[List[int]] = []
-    masks_all: List[List[int]] = []
-
-    with torch.inference_mode():
-        for batch in val_loader:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            image_tensor = batch.get("image_tensor", None)
-            raw_images = batch.get("raw_images", None)
-            if image_tensor is not None:
-                image_tensor = image_tensor.to(device)
-            if raw_images is not None:
-                raw_images = raw_images.to(device)
-
-            # 兼容 MQSPNSetNER.forward(decode_thr=...)
-            if decode_thr is None:
-                preds = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    image_tensor=image_tensor,
-                    raw_images=raw_images,
-                )
-            else:
-                try:
-                    preds = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        image_tensor=image_tensor,
-                        raw_images=raw_images,
-                        decode_thr=decode_thr,
-                    )
-                except TypeError:
-                    preds = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        image_tensor=image_tensor,
-                        raw_images=raw_images,
-                    )
-
-            bs = labels.size(0)
-            for i in range(bs):
-                preds_all.append(preds[i])
-                labels_all.append(labels[i].detach().cpu().tolist())
-                masks_all.append(attention_mask[i].detach().cpu().tolist())
-
-    return evaluate_predictions(
-        preds_per_sample=preds_all,
-        labels_per_sample=labels_all,
-        masks_per_sample=masks_all,
-        label2id=label2id,
-        type_names=type_names,
-        debug_n=debug_n,
-        score_thr=score_thr,
-        score_index=4,   # 你的 decode 输出 p_exist 在第 5 个
+    processor = MMPNERProcessor(data_path, args.text_encoder)
+    dataset = MMPNERDataset(
+        processor,
+        transform,
+        img_path=img_path[args.dataset_name],
+        max_seq=args.max_len,
+        sample_ratio=1.0,
+        mode=args.split,
+        clip_processor=clip_processor,
     )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=collate_fn,
+    )
+
+    model = MQSPNDetCRF(args, tokenizer=processor.tokenizer, label_mapping=dataset.label_mapping).to(device)
+
+    ckpt_path = os.path.join(args.ckpt_dir, "model.pt")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+
+    evaluate_crf_model(
+        model,
+        loader,
+        device,
+        dataset.label_mapping,
+        type_names=dataset.type_names,
+    )
+
+
+if __name__ == "__main__":
+    main()
