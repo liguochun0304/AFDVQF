@@ -3,7 +3,7 @@ LOG_DIR="../logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/test_${STAMP}.log"
 
-python ../test.py --save_name "2026-01-21_train-twitter2015_MNER_use_images_model_002" --device cuda:0 |& tee -a "$LOG_FILE"
+python ../test.py --save_name "2026-01-30_train-twitter2015_mqspn_original_mqspn_original_crf" --device cuda:0 |& tee -a "$LOG_FILE"
 rc=${PIPESTATUS[0]}
 /usr/bin/shutdown -h now
 exit $rc

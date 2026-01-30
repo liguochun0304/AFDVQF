@@ -37,6 +37,26 @@ def hungarian_match(cost: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             torch.as_tensor(col, dtype=torch.long, device=cost.device))
 
 
+def _best_span_indices(start_logits: torch.Tensor, end_logits: torch.Tensor, max_span_len: int) -> Optional[Tuple[int, int]]:
+    if start_logits.numel() == 0 or end_logits.numel() == 0:
+        return None
+    score = start_logits.unsqueeze(1) + end_logits.unsqueeze(0)
+    l = score.size(0)
+    idx = torch.arange(l, device=score.device)
+    span_len = idx.unsqueeze(1) - idx.unsqueeze(0) + 1
+    if max_span_len is None or max_span_len <= 0:
+        invalid = span_len < 1
+    else:
+        invalid = (span_len < 1) | (span_len > max_span_len)
+    score = score.masked_fill(invalid, float("-inf"))
+    if not torch.isfinite(score).any():
+        return None
+    flat_idx = score.view(-1).argmax().item()
+    s_idx = flat_idx // l
+    e_idx = flat_idx % l
+    return int(s_idx), int(e_idx)
+
+
 class TypeQueryGenerator(nn.Module):
     def __init__(self, text_encoder, tokenizer, type_names: List[str]):
         super().__init__()
@@ -364,23 +384,12 @@ class MQSPNModel(nn.Module):
                 s_logits = start_logits[b, q, valid_start:valid_end]
                 e_logits = end_logits[b, q, valid_start:valid_end]
 
-                if s_logits.numel() == 0 or e_logits.numel() == 0:
+                best = _best_span_indices(s_logits, e_logits, max_span_len)
+                if best is None:
                     continue
-
-                s_idx = s_logits.argmax().item()
-                e_idx = e_logits.argmax().item()
+                s_idx, e_idx = best
                 s = s_idx + valid_start
                 e = e_idx + valid_start
-
-                if e < s:
-                    s, e = e, s
-
-                span_len = e - s + 1
-                if span_len > max_span_len or span_len < 1:
-                    continue
-
-                if s < valid_start or e >= valid_end:
-                    continue
 
                 r = int(region_logits[b, q].argmax().item())
                 t = int(q_type_ids[q].item())
@@ -637,19 +646,12 @@ class MQSPNOriginalModel(nn.Module):
                     continue
                 s_logits = start_logits[b, q, valid_start:valid_end]
                 e_logits = end_logits[b, q, valid_start:valid_end]
-                if s_logits.numel() == 0 or e_logits.numel() == 0:
+                best = _best_span_indices(s_logits, e_logits, max_span_len)
+                if best is None:
                     continue
-                s_idx = s_logits.argmax().item()
-                e_idx = e_logits.argmax().item()
+                s_idx, e_idx = best
                 s = s_idx + valid_start
                 e = e_idx + valid_start
-                if e < s:
-                    s, e = e, s
-                span_len = e - s + 1
-                if span_len > max_span_len or span_len < 1:
-                    continue
-                if s < valid_start or e >= valid_end:
-                    continue
                 r = int(region_logits[b, q].argmax().item())
                 t = int(q_type_ids[q].item())
                 items.append((s, e, t, r, p_exist))
