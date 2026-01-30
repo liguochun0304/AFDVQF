@@ -373,9 +373,9 @@ def train(config):
             writer.add_scalar("train/loss", avg_loss, epoch)
             print("\n✅ Epoch {0} Train Loss: {1:.4f}".format(epoch, avg_loss))
 
-                acc, f1, p, r = evaluate_crf_model(
-                    model, val_loader, device, train_dataset.label_mapping, type_names=type_names
-                )
+            acc, f1, p, r = evaluate_crf_model(
+                model, val_loader, device, train_dataset.label_mapping, type_names=type_names
+            )
             print(
                 "🎯Epoch {0} Eval F1: {1:.4f} precision: {2:.4f} recall: {3:.4f} acc:{4:.4f}".format(epoch, f1, p, r, acc))
             writer.add_scalar("eval/f1", f1, epoch)
@@ -383,7 +383,7 @@ def train(config):
             writer.add_scalar("eval/recall", r, epoch)
             writer.add_scalar("eval/acc", acc, epoch)
 
-        # Early Stop
+            # Early Stop
             if f1 > best_f1 + config.patience:
                 best_f1 = f1
                 patience_counter = 0
