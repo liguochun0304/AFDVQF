@@ -85,6 +85,7 @@ def evaluate_crf_model(
                 attention_mask,
                 image_tensor=image_tensor,
                 raw_images=raw_images,
+                det_cache=batch.get("det_cache", None),
             )
 
             bs = labels.size(0)
@@ -147,6 +148,39 @@ def evaluate_crf_model(
     print("=" * 60)
     return acc, f1, p, r
 
+
+def _precompute_det_cache(model, dataset, batch_size, device):
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=collate_fn,
+    )
+    model.eval()
+    with torch.inference_mode():
+        for batch in loader:
+            raw_images = batch.get("raw_images", None)
+            img_names = batch.get("img_name", None)
+            if raw_images is None or img_names is None:
+                continue
+            raw_images = raw_images.to(device)
+            dets = model.vision_extractor._detect(raw_images)
+            for i, name in enumerate(img_names):
+                if name is None:
+                    continue
+                if dataset.get_det_cache(name) is not None:
+                    continue
+                boxes, labels, scores = dets[i]
+                dataset.set_det_cache(
+                    name,
+                    {
+                        "boxes": boxes.detach().cpu(),
+                        "labels": labels.detach().cpu(),
+                        "scores": scores.detach().cpu(),
+                    },
+                )
 
 def _build_data_paths(storage_root: str) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
     data_root = os.path.join(storage_root, "data")
@@ -243,6 +277,9 @@ def main():
     )
 
     model = MQSPNDetCRF(args, tokenizer=processor.tokenizer, label_mapping=dataset.label_mapping).to(device)
+
+    if args.use_image:
+        _precompute_det_cache(model, dataset, args.batch_size, device)
 
     ckpt_path = os.path.join(args.ckpt_dir, "model.pt")
     if not os.path.exists(ckpt_path):

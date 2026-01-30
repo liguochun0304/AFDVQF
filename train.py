@@ -67,6 +67,39 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
 
     return state["epoch"], state["best_f1"]
 
+def _precompute_det_cache(model, dataset, batch_size, device):
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        collate_fn=collate_fn
+    )
+    model.eval()
+    with torch.inference_mode():
+        for batch in tqdm(loader, desc="Precompute det cache", ncols=100):
+            raw_images = batch.get("raw_images", None)
+            img_names = batch.get("img_name", None)
+            if raw_images is None or img_names is None:
+                continue
+            raw_images = raw_images.to(device)
+            dets = model.vision_extractor._detect(raw_images)
+            for i, name in enumerate(img_names):
+                if name is None:
+                    continue
+                if dataset.get_det_cache(name) is not None:
+                    continue
+                boxes, labels, scores = dets[i]
+                dataset.set_det_cache(
+                    name,
+                    {
+                        "boxes": boxes.detach().cpu(),
+                        "labels": labels.detach().cpu(),
+                        "scores": scores.detach().cpu(),
+                    },
+                )
+
 
 def train(config):
     print("train config:", config)
@@ -184,6 +217,10 @@ def train(config):
     best_f1 = 0.0
     
     model = MQSPNDetCRF(config, tokenizer=tokenizer, label_mapping=train_dataset.label_mapping).to(device)
+
+    if config.use_image:
+        _precompute_det_cache(model, train_dataset, config.batch_size, device)
+        _precompute_det_cache(model, val_dataset, config.batch_size, device)
     
     if config.continue_train_name != "None":
         SAVE_ROOT = os.path.join(STORAGE_ROOT, "save_models")
@@ -289,6 +326,7 @@ def train(config):
                 attention_mask = batch["attention_mask"].to(device)
                 image_tensor = batch.get("image_tensor", None)
                 raw_images = batch.get("raw_images", None)
+                det_cache = batch.get("det_cache", None)
                 if image_tensor is not None:
                     image_tensor = image_tensor.to(device)
                 if raw_images is not None:
@@ -300,6 +338,7 @@ def train(config):
                     attention_mask,
                     image_tensor=image_tensor,
                     raw_images=raw_images,
+                    det_cache=det_cache,
                     labels=labels,
                 )
 
@@ -334,9 +373,9 @@ def train(config):
             writer.add_scalar("train/loss", avg_loss, epoch)
             print("\n✅ Epoch {0} Train Loss: {1:.4f}".format(epoch, avg_loss))
 
-            acc, f1, p, r = evaluate_crf_model(
-                model, val_loader, device, train_dataset.label_mapping, type_names=type_names
-            )
+                acc, f1, p, r = evaluate_crf_model(
+                    model, val_loader, device, train_dataset.label_mapping, type_names=type_names
+                )
             print(
                 "🎯Epoch {0} Eval F1: {1:.4f} precision: {2:.4f} recall: {3:.4f} acc:{4:.4f}".format(epoch, f1, p, r, acc))
             writer.add_scalar("eval/f1", f1, epoch)

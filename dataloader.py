@@ -202,11 +202,18 @@ class MMPNERDataset(Dataset):
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.clip_processor = clip_processor
         self.type_names = get_entity_type_names(self.label_mapping)
+        self._det_cache = {}
 
         # 常用 id
         self.cls_id = self.label_mapping.get("[CLS]")
         self.sep_id = self.label_mapping.get("[SEP]")
         self.x_id   = self.label_mapping.get("X")
+
+    def get_det_cache(self, img_name: str):
+        return self._det_cache.get(img_name)
+
+    def set_det_cache(self, img_name: str, det_data):
+        self._det_cache[img_name] = det_data
 
     def __len__(self):
         return len(self.data_dict['words'])
@@ -268,11 +275,15 @@ class MMPNERDataset(Dataset):
                 image_tensor = self.transform(img_pil)
 
         out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+        out["img_name"] = img
 
         if image_tensor is not None:
             out["image_tensor"] = image_tensor
         if raw_image is not None:
             out["raw_image"] = raw_image
+        cached = self.get_det_cache(img)
+        if cached is not None:
+            out["det_cache"] = cached
 
         return out
 
@@ -280,6 +291,7 @@ def collate_fn(batch):
     if isinstance(batch[0], dict):
         has_labels = "labels" in batch[0]
         has_image_tensor = "image_tensor" in batch[0]
+        has_det_cache = "det_cache" in batch[0]
 
         input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
         attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
@@ -287,12 +299,15 @@ def collate_fn(batch):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
         }
+        out["img_name"] = [b.get("img_name") for b in batch]
 
         if has_labels:
             out["labels"] = torch.stack([b["labels"] for b in batch], dim=0)
         if has_image_tensor:
             image_tensor = torch.stack([b["image_tensor"] for b in batch], dim=0)
             out["image_tensor"] = image_tensor
+        if has_det_cache:
+            out["det_cache"] = [b["det_cache"] for b in batch]
 
         # pad raw_images to same H/W
         raw_list = [b.get("raw_image", None) for b in batch]

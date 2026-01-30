@@ -208,8 +208,48 @@ class DualVisionTokenExtractor(nn.Module):
             results.append((boxes, labels, scores))
         return results
 
+    def _normalize_det_results(
+        self,
+        det_results,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        normalized = []
+        for item in det_results:
+            if item is None:
+                boxes = torch.zeros((0, 4), device=device, dtype=dtype)
+                labels = torch.zeros((0,), device=device, dtype=torch.long)
+                scores = torch.zeros((0,), device=device, dtype=dtype)
+                normalized.append((boxes, labels, scores))
+                continue
+
+            if isinstance(item, dict):
+                boxes = item.get("boxes", None)
+                labels = item.get("labels", None)
+                scores = item.get("scores", None)
+            elif isinstance(item, (tuple, list)) and len(item) >= 3:
+                boxes, labels, scores = item[0], item[1], item[2]
+            else:
+                boxes = labels = scores = None
+
+            if boxes is None or labels is None or scores is None:
+                boxes = torch.zeros((0, 4), device=device, dtype=dtype)
+                labels = torch.zeros((0,), device=device, dtype=torch.long)
+                scores = torch.zeros((0,), device=device, dtype=dtype)
+            else:
+                boxes = torch.as_tensor(boxes, device=device, dtype=dtype)
+                labels = torch.as_tensor(labels, device=device, dtype=torch.long)
+                scores = torch.as_tensor(scores, device=device, dtype=dtype)
+
+            normalized.append((boxes, labels, scores))
+        return normalized
+
     @torch.no_grad()
-    def _encode_regions(self, raw_images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode_regions(
+        self,
+        raw_images: torch.Tensor,
+        det_results=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         raw_images: [B,3,H,W] float RGB in [0,1]
         返回: region_tokens [B,R,H], region_mask [B,R]
@@ -218,7 +258,10 @@ class DualVisionTokenExtractor(nn.Module):
         device = raw_images.device
         max_regions = self.detector_topk
 
-        dets = self._detect(raw_images)
+        if det_results is None:
+            dets = self._detect(raw_images)
+        else:
+            dets = self._normalize_det_results(det_results, device, raw_images.dtype)
 
         region_feat = raw_images.new_zeros((B, max_regions, self.hidden_dim))
         region_mask = torch.zeros((B, max_regions), device=device, dtype=torch.long)
@@ -293,6 +336,7 @@ class DualVisionTokenExtractor(nn.Module):
         self,
         image_tensor: Optional[torch.Tensor],
         raw_images: Optional[torch.Tensor],
+        det_results=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         返回融合前的 vision tokens（patch + regions concat）
@@ -306,7 +350,7 @@ class DualVisionTokenExtractor(nn.Module):
             masks_list.append(pmask)
 
         if raw_images is not None:
-            rtok, rmask = self._encode_regions(raw_images)
+            rtok, rmask = self._encode_regions(raw_images, det_results=det_results)
             tokens_list.append(rtok)
             masks_list.append(rmask)
 
@@ -507,6 +551,7 @@ class MQSPNDetCRF(nn.Module):
         attention_mask: torch.Tensor,
         image_tensor: Optional[torch.Tensor] = None,
         raw_images: Optional[torch.Tensor] = None,
+        det_cache=None,
         labels: Optional[torch.Tensor] = None,
     ):
         # text encode
@@ -516,7 +561,11 @@ class MQSPNDetCRF(nn.Module):
 
         # vision tokens
         if self.use_image and (image_tensor is not None or raw_images is not None):
-            vis_feat, vis_mask = self.vision_extractor(image_tensor=image_tensor, raw_images=raw_images)  # [B,Mv,H], [B,Mv]
+            vis_feat, vis_mask = self.vision_extractor(
+                image_tensor=image_tensor,
+                raw_images=raw_images,
+                det_results=det_cache,
+            )  # [B,Mv,H], [B,Mv]
         else:
             vis_feat = torch.zeros((B, 1, H), device=text_feat.device, dtype=text_feat.dtype)
             vis_mask = torch.ones((B, 1), device=text_feat.device, dtype=torch.long)
