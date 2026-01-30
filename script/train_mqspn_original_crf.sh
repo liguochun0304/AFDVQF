@@ -6,7 +6,7 @@ LOG_FILE="$LOG_DIR/train_mqspn_original_crf_${STAMP}.log"
 python3 ../train.py \
   --device "cuda:0" \
   --epochs 50 \
-  --batch_size 16 \
+  --batch_size 128 \
   --drop_prob 0.5 \
   --fin_tuning_lr 2e-5 \
   --downs_en_lr 1e-4 \
