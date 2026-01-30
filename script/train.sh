@@ -17,6 +17,13 @@ DEVICE="cuda:0"
 DATASET="twitter2017"          # twitter2015 | twitter2017 | NewsMKG
 TEXT_ENCODER="bert"           # path or alias resolved in code
 IMAGE_ENCODER="clip-patch32"  # path or alias resolved in code
+REGION_MODE="detector_regions"  # clip_patches | detector_regions
+REGION_ADD_GLOBAL="--region_add_global"  # set to "" to disable
+TORCH_HOME="/root/autodl-fs/torch_cache"
+DET_TOPK=10
+DET_SCORE_THR=0.2
+DET_NMS_IOU=0.7
+DET_CKPT=""  # optional: /root/autodl-fs/weights/fasterrcnn.pt
 
 BATCH_SIZE=32
 EPOCHS=50
@@ -44,6 +51,19 @@ CMD=(
   --text_encoder "$TEXT_ENCODER"
   --image_encoder "$IMAGE_ENCODER"
   --use_image
+  --region_mode "$REGION_MODE"
+  $REGION_ADD_GLOBAL
+  --torch_home "$TORCH_HOME"
+  --detector_topk "$DET_TOPK"
+  --detector_score_thr "$DET_SCORE_THR"
+  --detector_nms_iou "$DET_NMS_IOU"
+)
+
+if [ -n "$DET_CKPT" ]; then
+  CMD+=(--detector_ckpt "$DET_CKPT")
+fi
+
+CMD+=(
   --model mqspn_original
   --decoder_type crf
   --batch_size "$BATCH_SIZE"
