@@ -1,46 +1,45 @@
 # AFNER
 
-AFNER 是一个面向多模态命名实体识别（MNER）的研究型实现，融合文本与图像信息进行实体抽取。模型核心为 `MQSPNDetCRF`：文本端使用 BERT/Roberta 编码，视觉端使用 CLIP，并支持两种视觉 token 获取方式（CLIP patch tokens 或 Faster R-CNN 检测区域），再通过“查询引导融合（QGF）”增强文本表示，最后用 CRF 解码 BIO 标签。
+A practical research implementation for **multimodal named entity recognition (MNER)** that fuses text and images. The core model, `MQSPNDetCRF`, combines a BERT/Roberta text encoder, a CLIP visual encoder, query-guided fusion, and CRF decoding over BIO tags. It is designed to run **offline with local weights**.
 
-**适用场景**
-- Twitter2015 / Twitter2017 / NewsMKG 等图文实体识别任务
-- 需要在离线环境中加载本地权重
+**Language:** English | [中文](README.zh-CN.md)
 
-**主要特性**
-- 文本编码：BERT/Roberta（本地加载）
-- 视觉编码：CLIP（本地加载）
-- 视觉 token（`clip_patches`）：CLIP patch tokens（可重采样为固定数量）
-- 视觉 token（`detector_regions`）：Faster R-CNN 检测框 → crop → CLIP region tokens
-- Query-guided Fusion（可堆叠多层）
-- CRF 解码（BIO 标签）
-- 离线友好：不依赖在线下载，权重路径可本地解析
+## Highlights
 
-## 目录结构
+- Text encoder: BERT / Roberta (local-only loading)
+- Visual encoder: CLIP (local-only loading)
+- Vision tokens (`clip_patches`): CLIP patch tokens (resampled to a fixed number)
+- Vision tokens (`detector_regions`): Faster R-CNN regions → crop → CLIP region tokens
+- Query-guided fusion (stackable layers)
+- CRF decoding for BIO tags
+- Offline-friendly path resolution for local weights
 
-- `train.py`：训练入口
-- `test.py`：评估入口（读取保存的 checkpoint）
-- `model.py`：模型实现（`MQSPNDetCRF`）
-- `dataloader.py`：数据处理与加载
-- `config.py`：训练参数定义
-- `script/`：常用训练/测试脚本
-- `requirements.txt`：依赖版本
-- `data/no_images.jpg`：缺图样本占位图
+## Project Layout
 
-## 环境准备
+- `train.py` - training entry
+- `test.py` - evaluation entry (loads saved checkpoints)
+- `model.py` - `MQSPNDetCRF` implementation
+- `dataloader.py` - data processing and dataset
+- `config.py` - argument definitions
+- `script/` - common training/testing scripts
+- `requirements.txt` - pinned dependencies
+- `data/no_images.jpg` - fallback image for missing samples
 
-建议使用 Python 3.9+（与本仓库依赖版本保持一致）。安装依赖：
+## Requirements
+
+Python 3.9+ is recommended.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> 注意：`torch/torchvision/transformers` 版本已在 `requirements.txt` 中固定。如需与本地 CUDA 对齐，可手动调整版本。
+Note: `torch/torchvision/transformers` are pinned in `requirements.txt`. Adjust them if you need a CUDA-specific build.
 
-## 数据与权重
+## Data and Paths
 
-默认数据根目录与权重目录约定为 `/root/autodl-fs`。
+Default root is `/root/autodl-fs`.
 
-数据路径（默认）：`/root/autodl-fs/data`，包含以下结构：
+Data layout under `/root/autodl-fs/data`:
 - `twitter2015/train.txt`
 - `twitter2015/valid.txt`
 - `twitter2015/test.txt`
@@ -52,31 +51,33 @@ pip install -r requirements.txt
 - `NewsMKG/train.txt`
 - `NewsMKG/valid.txt`
 - `NewsMKG/test.txt`
-- `NewsMKG/`（图片路径直接拼接）
+- `NewsMKG/` (image paths are appended directly)
 
-训练输出（默认）：`/root/autodl-fs/save_models/<run_name>`
+Training outputs (default): `/root/autodl-fs/save_models/<run_name>`
 
-TensorBoard 日志（默认）：`/root/tf-logs/<run_name>`
+TensorBoard logs (default): `/root/tf-logs/<run_name>`
 
-如果你的本地目录不同，可以：
-- 修改 `train.py` 中的 `STORAGE_ROOT` / `DATA_ROOT`
-- 或在测试时使用环境变量 `STORAGE_ROOT` / `SAVE_ROOT`
+If your paths differ:
+- Update `STORAGE_ROOT` / `DATA_ROOT` in `train.py`.
+- Or override `STORAGE_ROOT` / `SAVE_ROOT` for evaluation only.
 
-**本地权重**
+## Local Weights
 
-`text_encoder` / `image_encoder` 会走 `_resolve_path` 解析：
-- 绝对路径可直接使用
-- 相对路径会在 `/root/autodl-fs` 和项目目录下查找
+`text_encoder` and `image_encoder` are resolved by `_resolve_path`:
+- Absolute paths work directly.
+- Relative paths are searched under `/root/autodl-fs` and the project directory.
 
-## 训练
+Both encoders are loaded with `local_files_only=True`, so ensure the weights exist locally.
 
-推荐使用脚本快速启动：
+## Training
+
+Quick start with the provided script:
 
 ```bash
 bash script/train.sh
 ```
 
-或直接运行：
+Or run directly:
 
 ```bash
 python train.py \
@@ -89,14 +90,14 @@ python train.py \
   --region_add_global
 ```
 
-常用参数说明：
-- `--region_mode`：`clip_patches` 或 `detector_regions`
-- `--region_add_global`：在 region 序列前加全局 token
-- `--detector_ckpt`：离线时指定 Faster R-CNN 权重
+Common args:
+- `--region_mode`: `clip_patches` or `detector_regions`
+- `--region_add_global`: prepend a global image token
+- `--detector_ckpt`: Faster R-CNN weights for offline use
 
-## 评估
+## Evaluation
 
-`test.py` 会读取训练保存的 `config.json` 与 `model.pt`：
+`test.py` loads `config.json` and `model.pt` from a saved run directory:
 
 ```bash
 python test.py \
@@ -105,16 +106,24 @@ python test.py \
   --split test
 ```
 
-如需自定义保存根目录：
+Custom save root:
 
 ```bash
 SAVE_ROOT=/your/save_models \
 python test.py --save_name <run_name>
 ```
 
-## 备注
+## Notes
 
-- 缺失图片会回退到 `data/no_images.jpg`。
-- Faster R-CNN 默认会通过 torchvision 下载权重；离线环境建议提供 `--detector_ckpt`。
-- 如果仅使用文本，可去掉 `--use_image`。
+- Missing images fall back to `data/no_images.jpg`.
+- Faster R-CNN will download weights via torchvision by default. For strict offline use, pass `--detector_ckpt`.
+- For text-only runs, omit `--use_image`.
+
+## License
+
+See `LICENSE`.
+
+## Acknowledgements
+
+This repo builds on the open-source ecosystems of PyTorch, Transformers, and CLIP.
 
