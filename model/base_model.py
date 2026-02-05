@@ -141,6 +141,7 @@ class MQSPNDetCRF(nn.Module):
         raw_images: Optional[torch.Tensor] = None,
         det_cache=None,
         labels: Optional[torch.Tensor] = None,
+        return_loss_dict: bool = False,
     ):
         # text encode
         text_out = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
@@ -178,6 +179,7 @@ class MQSPNDetCRF(nn.Module):
         if labels is not None:
             ner_loss = -self.crf(emissions, labels, mask=mask, reduction="mean")
             total_loss = ner_loss
+            align_loss = text_feat.new_tensor(0.0)
             if self.use_alignment_loss and has_image:
                 text_global = text_feat[:, 0, :]
                 align_loss = contrastive_loss(
@@ -186,6 +188,12 @@ class MQSPNDetCRF(nn.Module):
                     temperature=self.alignment_temperature,
                 )
                 total_loss = total_loss + self.alignment_loss_weight * align_loss
+            if return_loss_dict:
+                return total_loss, {
+                    "total_loss": total_loss,
+                    "ner_loss": ner_loss,
+                    "align_loss": align_loss,
+                }
             return total_loss
 
         pred_tags = self.crf.decode(emissions, mask=mask)  # list[list[int]]

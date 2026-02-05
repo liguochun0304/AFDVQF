@@ -307,13 +307,19 @@ def train(config):
                     raw_images = raw_images.to(device)
 
                 labels = batch["labels"].to(device)
-                loss = model(
+                loss, loss_dict = model(
                     input_ids,
                     attention_mask,
                     image_tensor=image_tensor,
                     raw_images=raw_images,
                     labels=labels,
+                    return_loss_dict=True,
                 )
+
+                total_loss_val = loss_dict["total_loss"].item()
+                ner_loss_val = loss_dict["ner_loss"].item()
+                align_loss_val = loss_dict["align_loss"].item()
+                align_loss_w_val = align_loss_val * float(getattr(model, "alignment_loss_weight", 1.0))
 
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -337,10 +343,19 @@ def train(config):
                     current_lr = scheduler.get_last_lr()[0]
                     writer.add_scalar("train/grad_norm", total_norm, global_step)
                     writer.add_scalar("train/learning_rate", current_lr, global_step)
+                    writer.add_scalar("train/total_loss", total_loss_val, global_step)
+                    writer.add_scalar("train/ner_loss", ner_loss_val, global_step)
+                    writer.add_scalar("train/align_loss", align_loss_val, global_step)
+                    writer.add_scalar("train/align_loss_weighted", align_loss_w_val, global_step)
                     global_step += 1
 
-                total_loss += loss.item()
-                loop.set_postfix(loss="{0:.4f}".format(loss.item()), lr=optimizer.param_groups[0]['lr'])
+                total_loss += total_loss_val
+                loop.set_postfix(
+                    loss="{0:.4f}".format(total_loss_val),
+                    crf="{0:.4f}".format(ner_loss_val),
+                    align="{0:.4f}".format(align_loss_val),
+                    lr=optimizer.param_groups[0]['lr'],
+                )
 
             avg_loss = total_loss / len(train_loader)
             writer.add_scalar("train/loss", avg_loss, epoch)
