@@ -243,8 +243,10 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
         dataset,
         batch_size=getattr(config, "batch_size", 32),
         shuffle=False,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=getattr(config, "num_workers", 4),
+        pin_memory=getattr(config, "pin_memory", True),
+        persistent_workers=getattr(config, "persistent_workers", True),
+        prefetch_factor=getattr(config, "prefetch_factor", 2),
         collate_fn=collate_fn,
     )
 

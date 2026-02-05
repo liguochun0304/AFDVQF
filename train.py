@@ -154,9 +154,11 @@ def train(config):
     )
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=0,       # 避免多进程占用 /dev/shm
-        pin_memory=False,    # 关闭 pinned 内存以减轻内存压力
-        collate_fn=collate_fn
+        num_workers=getattr(config, "num_workers", 4),
+        pin_memory=getattr(config, "pin_memory", True),
+        persistent_workers=getattr(config, "persistent_workers", True),
+        prefetch_factor=getattr(config, "prefetch_factor", 2),
+        collate_fn=collate_fn,
     )
 
     val_dataset = MMPNERDataset(
@@ -174,9 +176,11 @@ def train(config):
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,  # 验证集不打乱
-        num_workers=0,       # 避免多进程占用 /dev/shm
-        pin_memory=False,
-        collate_fn=collate_fn
+        num_workers=getattr(config, "num_workers", 4),
+        pin_memory=getattr(config, "pin_memory", True),
+        persistent_workers=getattr(config, "persistent_workers", True),
+        prefetch_factor=getattr(config, "prefetch_factor", 2),
+        collate_fn=collate_fn,
     )
 
     config.num_labels = len(train_dataset.label_mapping)

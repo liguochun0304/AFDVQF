@@ -26,6 +26,14 @@ class Config:
     max_len: int = 128
     drop_prob: float = 0.2
 
+    # -----------------------------
+    # DataLoader performance
+    # -----------------------------
+    num_workers: int = 4
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+
     fin_tuning_lr: float = 3e-5
     downs_en_lr: float = 4e-4
     weight_decay_rate: float = 0.005
