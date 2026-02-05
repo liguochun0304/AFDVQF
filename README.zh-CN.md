@@ -8,8 +8,7 @@ AFNER 是一个面向**多模态命名实体识别（MNER）**的研究实现，
 
 - 文本编码：BERT / Roberta（本地加载）
 - 视觉编码：CLIP（本地加载）
-- 视觉 token（`clip_patches`）：CLIP patch tokens（重采样到固定数量）
-- 视觉 token（`detector_regions`）：Faster R-CNN 检测框 → crop → CLIP region tokens
+- 视觉 token：CLIP patch tokens + Faster R-CNN region tokens（拼接）
 - Query-guided Fusion（可堆叠多层）
 - CRF 解码（BIO 标签）
 - 适合离线环境的权重路径解析
@@ -20,8 +19,8 @@ AFNER 是一个面向**多模态命名实体识别（MNER）**的研究实现，
 - `test.py`：评估入口（读取保存的 checkpoint）
 - `model.py`：模型实现（`MQSPNDetCRF`）
 - `dataloader.py`：数据处理与加载
-- `config.py`：参数定义
-- `script/`：常用训练/测试脚本
+- `config.py`：固定的最佳模型配置
+- `script/`：训练/测试脚本（`train.sh`, `test.sh`）
 - `requirements.txt`：依赖版本
 - `data/no_images.jpg`：缺图样本占位图
 
@@ -80,30 +79,17 @@ bash script/train.sh
 或直接运行：
 
 ```bash
-python train.py \
-  --device cuda:0 \
-  --dataset_name twitter2015 \
-  --text_encoder /path/to/bert-or-roberta \
-  --image_encoder /path/to/clip \
-  --use_image \
-  --region_mode detector_regions \
-  --region_add_global
+python train.py
 ```
 
-常用参数：
-- `--region_mode`：`clip_patches` 或 `detector_regions`
-- `--region_add_global`：在 region 序列前拼接全局 token
-- `--detector_ckpt`：离线环境指定 Faster R-CNN 权重
+如需调整数据集 / 编码器 / 超参，请修改 `config.py`。
 
 ## 评估
 
 `test.py` 会读取保存目录内的 `config.json` 与 `model.pt`：
 
 ```bash
-python test.py \
-  --save_name 2026-01-30_train-twitter2015_mqspn_original_mqspn_original_crf \
-  --device cuda:0 \
-  --split test
+bash script/test.sh <save_name> [split] [device]
 ```
 
 自定义保存根目录：
@@ -116,8 +102,8 @@ python test.py --save_name <run_name>
 ## 备注
 
 - 缺失图片会回退到 `data/no_images.jpg`。
-- Faster R-CNN 默认会通过 torchvision 下载权重；严格离线环境请传 `--detector_ckpt`。
-- 仅文本场景可去掉 `--use_image`。
+- Faster R-CNN 默认会通过 torchvision 下载权重；严格离线环境请在 `config.py` 中设置 `detector_ckpt`。
+- 仅文本场景请在 `config.py` 中设置 `use_image=False`。
 
 ## 许可证
 
@@ -126,4 +112,3 @@ python test.py --save_name <run_name>
 ## 致谢
 
 感谢 PyTorch、Transformers、CLIP 等开源生态。
-

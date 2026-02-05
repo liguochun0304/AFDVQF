@@ -8,8 +8,7 @@ A practical research implementation for **multimodal named entity recognition (M
 
 - Text encoder: BERT / Roberta (local-only loading)
 - Visual encoder: CLIP (local-only loading)
-- Vision tokens (`clip_patches`): CLIP patch tokens (resampled to a fixed number)
-- Vision tokens (`detector_regions`): Faster R-CNN regions → crop → CLIP region tokens
+- Vision tokens: CLIP patch tokens + Faster R-CNN region tokens (concatenated)
 - Query-guided fusion (stackable layers)
 - CRF decoding for BIO tags
 - Offline-friendly path resolution for local weights
@@ -20,8 +19,8 @@ A practical research implementation for **multimodal named entity recognition (M
 - `test.py` - evaluation entry (loads saved checkpoints)
 - `model.py` - `MQSPNDetCRF` implementation
 - `dataloader.py` - data processing and dataset
-- `config.py` - argument definitions
-- `script/` - common training/testing scripts
+- `config.py` - fixed best-model config
+- `script/` - training/testing scripts (`train.sh`, `test.sh`)
 - `requirements.txt` - pinned dependencies
 - `data/no_images.jpg` - fallback image for missing samples
 
@@ -80,30 +79,17 @@ bash script/train.sh
 Or run directly:
 
 ```bash
-python train.py \
-  --device cuda:0 \
-  --dataset_name twitter2015 \
-  --text_encoder /path/to/bert-or-roberta \
-  --image_encoder /path/to/clip \
-  --use_image \
-  --region_mode detector_regions \
-  --region_add_global
+python train.py
 ```
 
-Common args:
-- `--region_mode`: `clip_patches` or `detector_regions`
-- `--region_add_global`: prepend a global image token
-- `--detector_ckpt`: Faster R-CNN weights for offline use
+To change dataset / encoders / hyper-params, edit `config.py`.
 
 ## Evaluation
 
 `test.py` loads `config.json` and `model.pt` from a saved run directory:
 
 ```bash
-python test.py \
-  --save_name 2026-01-30_train-twitter2015_mqspn_original_mqspn_original_crf \
-  --device cuda:0 \
-  --split test
+bash script/test.sh <save_name> [split] [device]
 ```
 
 Custom save root:
@@ -116,8 +102,8 @@ python test.py --save_name <run_name>
 ## Notes
 
 - Missing images fall back to `data/no_images.jpg`.
-- Faster R-CNN will download weights via torchvision by default. For strict offline use, pass `--detector_ckpt`.
-- For text-only runs, omit `--use_image`.
+- Faster R-CNN will download weights via torchvision by default. For strict offline use, set `detector_ckpt` in `config.py`.
+- For text-only runs, set `use_image=False` in `config.py`.
 
 ## License
 
@@ -126,4 +112,3 @@ See `LICENSE`.
 ## Acknowledgements
 
 This repo builds on the open-source ecosystems of PyTorch, Transformers, and CLIP.
-

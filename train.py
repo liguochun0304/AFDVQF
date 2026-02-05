@@ -3,6 +3,7 @@
 # @Author  : liguochun
 # @FileName: train.py
 # @Email   ：liguochun0304@163.com
+
 import json
 import os
 import random
@@ -18,7 +19,8 @@ from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup, CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from model import MQSPNDetCRF, _resolve_path
+from model import _resolve_path
+from model.base_model import MQSPNDetCRF
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 STORAGE_ROOT = "/root/autodl-fs"
@@ -69,10 +71,11 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
 
 def train(config):
     print("train config:", config)
+    model_name = "mqspn_det_crf"
     base_run_name = "{0}_train-{1}_{2}_{3}".format(
         datetime.now().strftime('%Y-%m-%d'),
         config.dataset_name,
-        str(config.model),
+        model_name,
         config.ex_name,
     )
     save_root = os.path.join(STORAGE_ROOT, "save_models")

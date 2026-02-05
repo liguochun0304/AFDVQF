@@ -1,17 +1,13 @@
-# STAMP=$(date +%F_%H%M%S)
-# LOG_DIR="../logs"
-# mkdir -p "$LOG_DIR"
-# LOG_FILE="$LOG_DIR/test_${STAMP}.log"
+#!/bin/bash
+set -euo pipefail
 
-python ../test.py --save_name "2026-01-30_train-twitter2015_mqspn_original_mqspn_original_crf" --device cuda:0
-#
-#
-#2025-08-14_train-twitter2015_MNER_B1_twitter2015_roberta_clip_align0/
-#2025-08-14_train-twitter2015_MNER_B2_twitter2015_roberta_clip_align0.05/
-#2025-08-14_train-twitter2015_MNER_B3_twitter2015_roberta_clip_align0.1/
-#2025-08-14_train-twitter2015_MNER_B4_twitter2015_roberta_clip_align0.2/
-#2025-08-14_train-twitter2017_MNER_B1_twitter2017_roberta_clip_align0/
-#2025-08-14_train-twitter2017_MNER_B2_twitter2017_roberta_clip_align0.05/
-#2025-08-14_train-twitter2017_MNER_B3_twitter2017_roberta_clip_align0.1/
-#2025-08-14_train-twitter2017_MNER_B4_twitter2017_roberta_clip_align0.2/
-#
+if [ $# -lt 1 ]; then
+  echo "Usage: bash script/test.sh <save_name> [split] [device]"
+  exit 1
+fi
+
+SAVE_NAME="$1"
+SPLIT="${2:-test}"
+DEVICE="${3:-cuda:0}"
+
+python test.py --save_name "$SAVE_NAME" --device "$DEVICE" --split "$SPLIT"
