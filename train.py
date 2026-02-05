@@ -4,6 +4,7 @@
 # @FileName: train.py
 # @Email   ：liguochun0304@163.com
 
+import argparse
 import json
 import os
 import random
@@ -20,7 +21,7 @@ from transformers import get_linear_schedule_with_warmup, CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
 from model import _resolve_path
-from model.base_model import MQSPNDetCRF
+from model.base_model import AFDVQF
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 STORAGE_ROOT = "/root/autodl-fs"
@@ -71,7 +72,7 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
 
 def train(config):
     print("train config:", config)
-    model_name = "mqspn_det_crf"
+    model_name = "afdvqf"
     base_run_name = "{0}_train-{1}_{2}_{3}".format(
         datetime.now().strftime('%Y-%m-%d'),
         config.dataset_name,
@@ -137,7 +138,9 @@ def train(config):
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225])])
     clip_processor = None
-    if config.use_image:
+    use_patch_tokens = getattr(config, "use_patch_tokens", True)
+    use_region_tokens = getattr(config, "use_region_tokens", True)
+    if config.use_image and use_patch_tokens:
         v_path = _resolve_path(script_dir, config.image_encoder)
         clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
 
@@ -191,7 +194,7 @@ def train(config):
     start_epoch = 0
     best_f1 = 0.0
     
-    model = MQSPNDetCRF(
+    model = AFDVQF(
         config,
         tokenizer=tokenizer,
         label_mapping=train_dataset.label_mapping,
@@ -299,8 +302,8 @@ def train(config):
             # image_tensor = batch[3].to(device, non_blocking=True)
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                image_tensor = batch.get("image_tensor", None)
-                raw_images = batch.get("raw_images", None)
+                image_tensor = batch.get("image_tensor", None) if use_patch_tokens else None
+                raw_images = batch.get("raw_images", None) if use_region_tokens else None
                 if image_tensor is not None:
                     image_tensor = image_tensor.to(device)
                 if raw_images is not None:
@@ -392,5 +395,37 @@ if __name__ == "__main__":
     from config import get_config
 
     set_seed(42)
+    def _parse_bool(v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError("Expected a boolean value")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_name", type=str, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--ex_name", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--max_len", type=int, default=None)
+    parser.add_argument("--use_image", type=_parse_bool, default=None)
+    parser.add_argument("--use_patch_tokens", type=_parse_bool, default=None)
+    parser.add_argument("--use_region_tokens", type=_parse_bool, default=None)
+    parser.add_argument("--use_alignment_loss", type=_parse_bool, default=None)
+    parser.add_argument("--alignment_loss_weight", type=float, default=None)
+    parser.add_argument("--use_adaptive_fusion", type=_parse_bool, default=None)
+    parser.add_argument("--qfnet_layers", type=int, default=None)
+    parser.add_argument("--qfnet_heads", type=int, default=None)
+    parser.add_argument("--detector_topk", type=int, default=None)
+    parser.add_argument("--detector_score_thr", type=float, default=None)
+    args = parser.parse_args()
+
     config = get_config()
+    for k, v in vars(args).items():
+        if v is not None:
+            setattr(config, k, v)
     train(config)

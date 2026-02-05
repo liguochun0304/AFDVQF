@@ -14,20 +14,15 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import CLIPProcessor
 
-from dataloader import bio_to_spans, MMPNERDataset, MMPNERProcessor, collate_fn
+from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
 from model import _resolve_path
-from model.base_model import MQSPNDetCRF
-
-SpanTuple = Tuple[int, int, int]
-Chunk = Tuple[str, int, int]
+from model.base_model import AFDVQF
 
 
-def _spans_to_chunks(spans: List[SpanTuple], type_names: List[str]) -> set:
-    out = set()
-    for s, e, t in spans:
-        if 0 <= t < len(type_names):
-            out.add((type_names[t], s, e + 1))  # end exclusive
-    return out
+def _tag_to_type(tag: str) -> Optional[str]:
+    if tag.startswith("B-") or tag.startswith("I-"):
+        return tag.split("-", 1)[1]
+    return None
 
 
 def evaluate_crf_model(
@@ -40,22 +35,27 @@ def evaluate_crf_model(
 ) -> Tuple[float, float, float, float]:
     model.eval()
     idx2tag = {v: k for k, v in label_mapping.items()}
-    type_name2id = {name: i for i, name in enumerate(type_names)}
+    ignore_tags = {"X", "[CLS]", "[SEP]", "PAD"}
 
-    correct = 0.0
+    correct_entity = 0.0
     total_pred = 0.0
     total_gold = 0.0
-    exact_flags = []
+    correct_token = 0.0
+    total_token = 0.0
     type_stats = {t: [0, 0, 0] for t in type_names}
-    debug_samples: List[Tuple[List[str], List[str], List[SpanTuple], List[SpanTuple], List[Chunk], List[Chunk]]] = []
+    debug_samples: List[Tuple[int, int, int, float]] = []
+    num_samples = 0
+
+    use_patch_tokens = getattr(model, "use_patch_tokens", True)
+    use_region_tokens = getattr(model, "use_region_tokens", True)
 
     with torch.inference_mode():
         for batch in val_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
-            image_tensor = batch.get("image_tensor", None)
-            raw_images = batch.get("raw_images", None)
+            image_tensor = batch.get("image_tensor", None) if use_patch_tokens else None
+            raw_images = batch.get("raw_images", None) if use_region_tokens else None
             if image_tensor is not None:
                 image_tensor = image_tensor.to(device)
             if raw_images is not None:
@@ -70,71 +70,77 @@ def evaluate_crf_model(
 
             bs = labels.size(0)
             for i in range(bs):
+                num_samples += 1
                 valid_len = int(attention_mask[i].sum().item())
                 if valid_len <= 2:
-                    exact_flags.append(1.0)
                     continue
 
                 raw_pred = pred_tags_batch[i]
                 pred_seq = raw_pred[1:valid_len - 1] if isinstance(raw_pred, list) else raw_pred[1:valid_len - 1].cpu().tolist()
                 gold_seq = labels[i, 1:valid_len - 1].cpu().tolist()
 
-                pred_tag_strs = [idx2tag.get(tid, "O") for tid in pred_seq]
-                gold_tag_strs = [idx2tag.get(tid, "O") for tid in gold_seq]
+                sample_total_tokens = 0
+                sample_correct_tokens = 0
+                sample_pred_ent = 0
+                sample_gold_ent = 0
+                sample_correct_ent = 0
 
-                pred_spans_ent = bio_to_spans(pred_seq, idx2tag, type_name2id)
-                gold_spans_ent = bio_to_spans(gold_seq, idx2tag, type_name2id)
+                for pred_id, gold_id in zip(pred_seq, gold_seq):
+                    pred_tag = idx2tag.get(pred_id, "O")
+                    gold_tag = idx2tag.get(gold_id, "O")
 
-                pred_set = {(e.start, e.end, e.type_id) for e in pred_spans_ent}
-                gold_set = {(e.start, e.end, e.type_id) for e in gold_spans_ent}
+                    if gold_tag in ignore_tags:
+                        continue
 
-                pred_spans = [(e.start, e.end, e.type_id) for e in pred_spans_ent]
-                gold_spans = [(e.start, e.end, e.type_id) for e in gold_spans_ent]
-                pred_chunks = _spans_to_chunks(pred_spans, type_names)
-                gold_chunks = _spans_to_chunks(gold_spans, type_names)
+                    sample_total_tokens += 1
+                    total_token += 1
+                    if pred_tag == gold_tag:
+                        sample_correct_tokens += 1
+                        correct_token += 1
 
-                correct += len(pred_set & gold_set)
-                total_pred += len(pred_set)
-                total_gold += len(gold_set)
-                exact_flags.append(1.0 if pred_set == gold_set else 0.0)
+                    pred_type = _tag_to_type(pred_tag)
+                    gold_type = _tag_to_type(gold_tag)
 
-                for ent_type in type_names:
-                    pset = {c for c in pred_chunks if c[0] == ent_type}
-                    gset = {c for c in gold_chunks if c[0] == ent_type}
-                    type_stats[ent_type][0] += len(pset & gset)
-                    type_stats[ent_type][1] += len(pset)
-                    type_stats[ent_type][2] += len(gset)
+                    if pred_type is not None:
+                        sample_pred_ent += 1
+                        total_pred += 1
+                        type_stats[pred_type][1] += 1
+                    if gold_type is not None:
+                        sample_gold_ent += 1
+                        total_gold += 1
+                        type_stats[gold_type][2] += 1
+                    if pred_tag == gold_tag and gold_type is not None:
+                        sample_correct_ent += 1
+                        correct_entity += 1
+                        type_stats[gold_type][0] += 1
 
                 if len(debug_samples) < debug_n:
-                    debug_samples.append((pred_tag_strs, gold_tag_strs, pred_spans, gold_spans, sorted(pred_chunks), sorted(gold_chunks)))
+                    token_acc = sample_correct_tokens / sample_total_tokens if sample_total_tokens > 0 else 0.0
+                    debug_samples.append((sample_pred_ent, sample_gold_ent, sample_correct_ent, token_acc))
 
-    p = correct / total_pred if total_pred > 0 else 0.0
-    r = correct / total_gold if total_gold > 0 else 0.0
+    p = correct_entity / total_pred if total_pred > 0 else 0.0
+    r = correct_entity / total_gold if total_gold > 0 else 0.0
     f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-    acc = float(sum(exact_flags) / len(exact_flags)) if exact_flags else 0.0
+    acc = correct_token / total_token if total_token > 0 else 0.0
 
     print("=" * 60)
-    print("CRF decode 评估 (BIO tag → spans)")
+    print("CRF decode 评估 (BIO tag → token-level)")
     print("=" * 60)
-    for i, (pred_tags, gold_tags, ps, gs, pc, gc) in enumerate(debug_samples, 1):
-        ps_str = [(s, e, type_names[t]) for s, e, t in ps]
-        gs_str = [(s, e, type_names[t]) for s, e, t in gs]
-        print(f"\n样本 {i}:")
-        print(f"  预测 tag序列: {pred_tags}")
-        print(f"  真实 tag序列: {gold_tags}")
-        print(f"  预测 spans: {ps_str}")
-        print(f"  真实 spans: {gs_str}")
-        print(f"  预测 chunks: {pc}")
-        print(f"  真实 chunks: {gc}")
+    print(f"Samples: {num_samples} | Pred ent tokens: {int(total_pred)} | Gold ent tokens: {int(total_gold)} | Correct ent tokens: {int(correct_entity)}")
+    print(f"Overall: Acc(Token)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
 
-    print(f"\n总体: Acc(ExactMatch)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
-    print("\n按类别:")
+    if debug_samples:
+        print("\nExamples (summary only):")
+        for i, (pred_n, gold_n, corr_n, token_acc) in enumerate(debug_samples, 1):
+            print(f"  Sample {i}: pred={pred_n} gold={gold_n} correct={corr_n} token_acc={token_acc:.4f}")
+
+    print("\nPer-type:")
     for ent_type in type_names:
         cp, tp, tc = type_stats[ent_type]
         p_c = cp / tp if tp > 0 else 0.0
         r_c = cp / tc if tc > 0 else 0.0
         f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
-        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f}")
+        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f} (correct={cp} pred={tp} gold={tc})")
     print("=" * 60)
     return acc, f1, p, r
 
@@ -222,7 +228,8 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
     ])
 
     clip_processor = None
-    if getattr(config, "use_image", False):
+    use_patch_tokens = getattr(config, "use_patch_tokens", True)
+    if getattr(config, "use_image", False) and use_patch_tokens:
         v_path = _resolve_path(script_dir, getattr(config, "image_encoder", ""))
         if not v_path:
             raise ValueError(f"image_encoder 路径无效或不存在: {getattr(config, 'image_encoder', '')}")
@@ -251,7 +258,7 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
     )
 
     config.num_labels = len(dataset.label_mapping)
-    model = MQSPNDetCRF(
+    model = AFDVQF(
         config,
         tokenizer=processor.tokenizer,
         label_mapping=dataset.label_mapping,

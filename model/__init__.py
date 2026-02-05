@@ -5,7 +5,6 @@
 # @Email   ：liguochun0304@163.com
 
 import os
-from dataclasses import dataclass
 from typing import Optional
 
 
@@ -19,11 +18,3 @@ def _resolve_path(script_dir: str, path: Optional[str]) -> Optional[str]:
         if os.path.exists(cand):
             return cand
     return None
-
-
-@dataclass
-class EntityTarget:
-    start: int
-    end: int
-    type_id: int
-    region_id: int = -1

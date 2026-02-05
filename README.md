@@ -1,6 +1,8 @@
-# AFNER
+# AFDVQF
+**AFDVQF: Alignment‑Fusion Dual‑branch Vision Query Fusion for Multimodal Named Entity Recognition**
+中文名：对齐融合的双分支视觉查询融合多模态命名实体识别（AFDVQF）
 
-A practical research implementation for **multimodal named entity recognition (MNER)** that fuses text and images. The core model, `MQSPNDetCRF`, combines a BERT/Roberta text encoder, a CLIP visual encoder, query-guided fusion, and CRF decoding over BIO tags. It is designed to run **offline with local weights**.
+AFDVQF is a practical research implementation for **multimodal named entity recognition (MNER)** that fuses text and images. The core model, `AFDVQF`, combines a BERT/Roberta text encoder, a CLIP visual encoder, dual-branch vision tokens, query-guided fusion, alignment-enhanced training, and CRF decoding over BIO tags. It is designed to run **offline with local weights**.
 
 **Language:** English | [中文](README.zh-CN.md)
 
@@ -9,6 +11,7 @@ A practical research implementation for **multimodal named entity recognition (M
 - Text encoder: BERT / Roberta (local-only loading)
 - Visual encoder: CLIP (local-only loading)
 - Vision tokens: CLIP patch tokens + Faster R-CNN region tokens (concatenated)
+- Region tokens enhanced with label / score / box embeddings
 - Query-guided fusion (stackable layers)
 - Optional adaptive fusion after QGF
 - CRF decoding for BIO tags
@@ -44,7 +47,7 @@ bash script/test.sh <save_name> [split] [device]
 - `config.py` - configuration and hyper-params
 - `dataloader.py` - data processing and dataset
 - `data/processor.py` - dataset processor utilities
-- `model/base_model.py` - `MQSPNDetCRF` main model
+- `model/base_model.py` - `AFDVQF` main model
 - `model/dual_vision_extractor.py` - CLIP + Faster R-CNN vision tokens
 - `model/query_guided_fusion.py` - QGF + adaptive fusion
 - `model/loss_functions.py` - contrastive alignment loss
@@ -126,6 +129,37 @@ Custom save root:
 SAVE_ROOT=/your/save_models \
 python test.py --save_name <run_name>
 ```
+
+## Ablation
+
+We provide a unified ablation runner in `script/ablation.sh`.
+
+List available ablations:
+
+```bash
+bash script/ablation.sh --list
+```
+
+Run all ablations:
+
+```bash
+bash script/ablation.sh --exp all --dataset twitter2015 --device cuda:0
+```
+
+Run selected ablations:
+
+```bash
+bash script/ablation.sh --exp no_region --exp no_align --epochs 30 --batch_size 16
+```
+
+Available ablations:
+- `full`: full model (baseline)
+- `no_align`: disable alignment loss
+- `no_adapt`: disable adaptive fusion
+- `no_region`: disable region tokens (CLIP patch only)
+- `no_patch`: disable patch tokens (detector regions only)
+- `text_only`: disable all image inputs
+- `qfnet1`: set `qfnet_layers=1`
 
 ## Notes
 

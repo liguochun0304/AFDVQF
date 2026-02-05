@@ -17,6 +17,8 @@ class Config:
     text_encoder: str = "bert"
     image_encoder: str = "clip-patch32"
     use_image: bool = True
+    use_patch_tokens: bool = True
+    use_region_tokens: bool = True
 
     # -----------------------------
     # Training hyper-params
@@ -72,7 +74,7 @@ class Config:
     # -----------------------------
     # Run meta
     # -----------------------------
-    ex_name: str = "mqspn_det_crf_best"
+    ex_name: str = "afdvqf_best"
     continue_train_name: str = "None"
 
 

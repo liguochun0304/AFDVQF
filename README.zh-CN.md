@@ -1,6 +1,8 @@
-# AFNER
+# AFDVQF
+**AFDVQF：对齐融合的双分支视觉查询融合多模态命名实体识别**
+中文名：对齐融合的双分支视觉查询融合多模态命名实体识别（AFDVQF）
 
-AFNER 是一个面向**多模态命名实体识别（MNER）**的研究实现，融合文本与图像信息进行实体抽取。核心模型 `MQSPNDetCRF` 由 BERT/Roberta 文本编码、CLIP 视觉编码、查询引导融合（QGF）和 CRF 解码组成，并支持**离线本地权重**加载。
+AFDVQF 是一个面向**多模态命名实体识别（MNER）**的研究实现，融合文本与图像信息进行实体抽取。核心模型 `AFDVQF` 由 BERT/Roberta 文本编码、CLIP 视觉编码、双分支视觉 token、查询引导融合（QGF）、对齐增强训练与 CRF 解码组成，并支持**离线本地权重**加载。
 
 **Language:** [English](README.md) | 中文
 
@@ -9,6 +11,7 @@ AFNER 是一个面向**多模态命名实体识别（MNER）**的研究实现，
 - 文本编码：BERT / Roberta（本地加载）
 - 视觉编码：CLIP（本地加载）
 - 视觉 token：CLIP patch tokens + Faster R-CNN region tokens（拼接）
+- Region token 注入 label / score / box embedding
 - Query-guided Fusion（可堆叠多层）
 - 可选自适应融合层
 - CRF 解码（BIO 标签）
@@ -44,7 +47,7 @@ bash script/test.sh <save_name> [split] [device]
 - `config.py`：配置与超参数
 - `dataloader.py`：数据处理与加载
 - `data/processor.py`：数据处理工具
-- `model/base_model.py`：主模型 `MQSPNDetCRF`
+- `model/base_model.py`：主模型 `AFDVQF`
 - `model/dual_vision_extractor.py`：CLIP + Faster R-CNN 视觉 token
 - `model/query_guided_fusion.py`：QGF 与自适应融合
 - `model/loss_functions.py`：对齐损失定义
@@ -126,6 +129,37 @@ bash script/test.sh <save_name> [split] [device]
 SAVE_ROOT=/your/save_models \
 python test.py --save_name <run_name>
 ```
+
+## 消融实验
+
+我们提供统一的消融脚本：`script/ablation.sh`。
+
+查看可用消融：
+
+```bash
+bash script/ablation.sh --list
+```
+
+运行全部消融：
+
+```bash
+bash script/ablation.sh --exp all --dataset twitter2015 --device cuda:0
+```
+
+只运行指定消融：
+
+```bash
+bash script/ablation.sh --exp no_region --exp no_align --epochs 30 --batch_size 16
+```
+
+可用消融项：
+- `full`：完整模型（baseline）
+- `no_align`：关闭对齐损失
+- `no_adapt`：关闭自适应融合
+- `no_region`：只保留 CLIP patch tokens（去掉 region tokens）
+- `no_patch`：只保留 region tokens（去掉 patch tokens）
+- `text_only`：纯文本
+- `qfnet1`：设置 `qfnet_layers=1`
 
 ## 备注
 

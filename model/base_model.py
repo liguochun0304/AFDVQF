@@ -56,10 +56,10 @@ def _masked_mean(feat: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (feat * m.unsqueeze(-1)).sum(dim=1) / denom
 
 
-class MQSPNDetCRF(nn.Module):
+class AFDVQF(nn.Module):
     """
-    你最终要的“一个模型”：
-      TextEncoder -> (DualVisionTokenExtractor) -> (TypeQuery + MQS + QGF×N) -> Linear -> CRF
+    Alignment-Fusion Dual-branch Vision Query Fusion.
+      TextEncoder -> DualVisionTokenExtractor -> TypeQuery + MQS + QGF×N -> Linear -> CRF
     训练：传 labels（BIO tag id 序列），返回 loss
     推理：不传 labels，返回 pred_tags(list[list[int]])
     """
@@ -70,6 +70,8 @@ class MQSPNDetCRF(nn.Module):
         self.script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
         self.use_image = bool(getattr(config, "use_image", True))
+        self.use_patch_tokens = bool(getattr(config, "use_patch_tokens", True))
+        self.use_region_tokens = bool(getattr(config, "use_region_tokens", True))
         self.dropout_rate = float(getattr(config, "drop_prob", 0.1))
         self.use_alignment_loss = bool(getattr(config, "use_alignment_loss", True))
         self.alignment_loss_weight = float(getattr(config, "alignment_loss_weight", 0.1))
