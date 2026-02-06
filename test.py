@@ -15,6 +15,7 @@ from torchvision import transforms
 from transformers import CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
+from metrics import evaluate_token_level, evaluate_each_class_token_level
 from model import _resolve_path
 from model.base_model import AFDVQF
 
@@ -34,15 +35,10 @@ def evaluate_crf_model(
     debug_n: int = 3,
 ) -> Tuple[float, float, float, float]:
     model.eval()
-    idx2tag = {v: k for k, v in label_mapping.items()}
     ignore_tags = {"X", "[CLS]", "[SEP]", "PAD"}
 
-    correct_entity = 0.0
-    total_pred = 0.0
-    total_gold = 0.0
-    correct_token = 0.0
-    total_token = 0.0
-    type_stats = {t: [0, 0, 0] for t in type_names}
+    labels_pred_all: List[List[int]] = []
+    labels_all: List[List[int]] = []
     debug_samples: List[Tuple[int, int, int, float]] = []
     num_samples = 0
 
@@ -76,57 +72,46 @@ def evaluate_crf_model(
                     continue
 
                 raw_pred = pred_tags_batch[i]
-                pred_seq = raw_pred[1:valid_len - 1] if isinstance(raw_pred, list) else raw_pred[1:valid_len - 1].cpu().tolist()
-                gold_seq = labels[i, 1:valid_len - 1].cpu().tolist()
+                pred_seq = raw_pred[:valid_len] if isinstance(raw_pred, list) else raw_pred[:valid_len].cpu().tolist()
+                gold_seq = labels[i, :valid_len].cpu().tolist()
 
-                sample_total_tokens = 0
-                sample_correct_tokens = 0
-                sample_pred_ent = 0
-                sample_gold_ent = 0
-                sample_correct_ent = 0
-
-                for pred_id, gold_id in zip(pred_seq, gold_seq):
-                    pred_tag = idx2tag.get(pred_id, "O")
-                    gold_tag = idx2tag.get(gold_id, "O")
-
-                    if gold_tag in ignore_tags:
-                        continue
-
-                    sample_total_tokens += 1
-                    total_token += 1
-                    if pred_tag == gold_tag:
-                        sample_correct_tokens += 1
-                        correct_token += 1
-
-                    pred_type = _tag_to_type(pred_tag)
-                    gold_type = _tag_to_type(gold_tag)
-
-                    if pred_type is not None:
-                        sample_pred_ent += 1
-                        total_pred += 1
-                        type_stats[pred_type][1] += 1
-                    if gold_type is not None:
-                        sample_gold_ent += 1
-                        total_gold += 1
-                        type_stats[gold_type][2] += 1
-                    if pred_tag == gold_tag and gold_type is not None:
-                        sample_correct_ent += 1
-                        correct_entity += 1
-                        type_stats[gold_type][0] += 1
+                labels_pred_all.append(pred_seq)
+                labels_all.append(gold_seq)
 
                 if len(debug_samples) < debug_n:
+                    sample_total_tokens = 0
+                    sample_correct_tokens = 0
+                    sample_pred_ent = 0
+                    sample_gold_ent = 0
+                    sample_correct_ent = 0
+
+                    idx2tag = {v: k for k, v in label_mapping.items()}
+                    for pred_id, gold_id in zip(pred_seq, gold_seq):
+                        pred_tag = idx2tag.get(pred_id, "O")
+                        gold_tag = idx2tag.get(gold_id, "O")
+                        if gold_tag in ignore_tags:
+                            continue
+                        sample_total_tokens += 1
+                        if pred_tag == gold_tag:
+                            sample_correct_tokens += 1
+                        pred_type = _tag_to_type(pred_tag)
+                        gold_type = _tag_to_type(gold_tag)
+                        if pred_type is not None:
+                            sample_pred_ent += 1
+                        if gold_type is not None:
+                            sample_gold_ent += 1
+                        if pred_tag == gold_tag and gold_type is not None:
+                            sample_correct_ent += 1
+
                     token_acc = sample_correct_tokens / sample_total_tokens if sample_total_tokens > 0 else 0.0
                     debug_samples.append((sample_pred_ent, sample_gold_ent, sample_correct_ent, token_acc))
 
-    p = correct_entity / total_pred if total_pred > 0 else 0.0
-    r = correct_entity / total_gold if total_gold > 0 else 0.0
-    f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-    acc = correct_token / total_token if total_token > 0 else 0.0
+    acc, f1, p, r = evaluate_token_level(labels_pred_all, labels_all, label_mapping, ignore_tags)
 
     print("=" * 60)
-    print("CRF decode 评估 (BIO tag → token-level)")
+    print("CRF decode 评估 (metrics.py token-level)")
     print("=" * 60)
-    print(f"Samples: {num_samples} | Pred ent tokens: {int(total_pred)} | Gold ent tokens: {int(total_gold)} | Correct ent tokens: {int(correct_entity)}")
+    print(f"Samples: {num_samples}")
     print(f"Overall: Acc(Token)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
 
     if debug_samples:
@@ -136,11 +121,14 @@ def evaluate_crf_model(
 
     print("\nPer-type:")
     for ent_type in type_names:
-        cp, tp, tc = type_stats[ent_type]
-        p_c = cp / tp if tp > 0 else 0.0
-        r_c = cp / tc if tc > 0 else 0.0
-        f1_c = 2 * p_c * r_c / (p_c + r_c) if (p_c + r_c) > 0 else 0.0
-        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f} (correct={cp} pred={tp} gold={tc})")
+        f1_c, p_c, r_c = evaluate_each_class_token_level(
+            labels_pred_all,
+            labels_all,
+            label_mapping,
+            ent_type,
+            ignore_tags,
+        )
+        print(f"  {ent_type}: P={p_c:.4f} R={r_c:.4f} F1={f1_c:.4f}")
     print("=" * 60)
     return acc, f1, p, r
 
