@@ -15,7 +15,7 @@ from torchvision import transforms
 from transformers import CLIPProcessor
 
 from dataloader import MMPNERDataset, MMPNERProcessor, collate_fn
-from metrics import evaluate_token_level, evaluate_each_class_token_level
+from metrics import evaluate_chunk_level, evaluate_each_class_chunk_level
 from model import _resolve_path
 from model.base_model import AFDVQF
 
@@ -106,10 +106,10 @@ def evaluate_crf_model(
                     token_acc = sample_correct_tokens / sample_total_tokens if sample_total_tokens > 0 else 0.0
                     debug_samples.append((sample_pred_ent, sample_gold_ent, sample_correct_ent, token_acc))
 
-    acc, f1, p, r = evaluate_token_level(labels_pred_all, labels_all, label_mapping, ignore_tags)
+    acc, f1, p, r = evaluate_chunk_level(labels_pred_all, labels_all, label_mapping, ignore_tags)
 
     print("=" * 60)
-    print("CRF decode 评估 (metrics.py token-level)")
+    print("CRF decode 评估 (metrics.py span-level)")
     print("=" * 60)
     print(f"Samples: {num_samples}")
     print(f"Overall: Acc(Token)={acc:.4f}  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
@@ -121,7 +121,7 @@ def evaluate_crf_model(
 
     print("\nPer-type:")
     for ent_type in type_names:
-        f1_c, p_c, r_c = evaluate_each_class_token_level(
+        f1_c, p_c, r_c = evaluate_each_class_chunk_level(
             labels_pred_all,
             labels_all,
             label_mapping,
