@@ -235,11 +235,13 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
             raise ValueError(f"image_encoder 路径无效或不存在: {getattr(config, 'image_encoder', '')}")
         clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
 
-    processor = MMPNERProcessor(data_path, getattr(config, "text_encoder", ""))
+    dataset_data_path = data_path[dataset_name]
+    dataset_img_path = img_path[dataset_name]
+    processor = MMPNERProcessor(dataset_data_path, getattr(config, "text_encoder", ""))
     dataset = MMPNERDataset(
         processor,
         transform,
-        img_path=img_path[dataset_name],
+        img_path=dataset_img_path,
         max_seq=getattr(config, "max_len", 128),
         sample_ratio=1.0,
         mode=split,
