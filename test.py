@@ -265,7 +265,17 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
         tokenizer=processor.tokenizer,
         label_mapping=dataset.label_mapping,
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    state = torch.load(model_path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    state = {k: v for k, v in state.items() if not k.startswith("vision_extractor._detector.")}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print("[Warn] load_state_dict mismatch:")
+        if missing:
+            print("  missing (first 20):", missing[:20])
+        if unexpected:
+            print("  unexpected (first 20):", unexpected[:20])
 
     acc, f1, p, r = evaluate_crf_model(
         model,

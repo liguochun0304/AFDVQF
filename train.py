@@ -44,10 +44,15 @@ def set_seed(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 
+def _filtered_state_dict(model):
+    state = model.state_dict()
+    return {k: v for k, v in state.items() if not k.startswith("vision_extractor._detector.")}
+
+
 def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, best_metric):
     os.makedirs(save_dir, exist_ok=True)
 
-    torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))
+    torch.save(_filtered_state_dict(model), os.path.join(save_dir, "model.pt"))
     torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
     torch.save(scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
 
@@ -60,7 +65,11 @@ def save_model_checkpoint(model, optimizer, scheduler, config, save_dir, epoch, 
 
 def load_model_checkpoint(model, optimizer, scheduler, load_dir):
     device = next(model.parameters()).device
-    model.load_state_dict(torch.load(os.path.join(load_dir, "model.pt"), map_location=device))
+    state = torch.load(os.path.join(load_dir, "model.pt"), map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    state = {k: v for k, v in state.items() if not k.startswith("vision_extractor._detector.")}
+    model.load_state_dict(state, strict=False)
     optimizer.load_state_dict(torch.load(os.path.join(load_dir, "optimizer.pt"), map_location=device))
     scheduler.load_state_dict(torch.load(os.path.join(load_dir, "scheduler.pt"), map_location=device))
 
