@@ -6,8 +6,10 @@
 
 from typing import Dict, List, Tuple, Optional, Any
 import argparse
+import csv
 import json
 import os
+from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
@@ -159,7 +161,44 @@ def _resolve_device(device_str: str) -> torch.device:
         return torch.device("cpu")
 
 
-def run_test(save_name: str, save_root: str, device_str: str, batch_size: Optional[int], max_len: Optional[int], split: str) -> None:
+def _append_record(
+    record_file: str,
+    save_name: str,
+    dataset_name: str,
+    split: str,
+    acc: float,
+    p: float,
+    r: float,
+    f1: float,
+) -> None:
+    path = os.path.abspath(record_file)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_header = (not os.path.exists(path)) or (os.path.getsize(path) == 0)
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["timestamp", "save_name", "dataset", "split", "acc", "precision", "recall", "f1"])
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            save_name,
+            dataset_name,
+            split,
+            f"{acc:.4f}",
+            f"{p:.4f}",
+            f"{r:.4f}",
+            f"{f1:.4f}",
+        ])
+
+
+def run_test(
+    save_name: str,
+    save_root: str,
+    device_str: str,
+    batch_size: Optional[int],
+    max_len: Optional[int],
+    split: str,
+    record_file: Optional[str],
+) -> None:
     save_dir = os.path.join(save_root, save_name)
     model_path = os.path.join(save_dir, "model.pt")
     if not os.path.exists(model_path):
@@ -287,6 +326,8 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
         type_names=dataset.type_names,
     )
     print(f"[Overall] Acc={acc:.4f} P={p:.4f} R={r:.4f} F1={f1:.4f}")
+    if record_file:
+        _append_record(record_file, save_name, dataset_name, split, acc, p, r, f1)
 
 
 if __name__ == "__main__":
@@ -297,6 +338,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_len", type=int, default=None)
     parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--record_file", type=str, default=None)
 
     args = parser.parse_args()
     run_test(
@@ -306,4 +348,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_len=args.max_len,
         split=args.split,
+        record_file=args.record_file,
     )

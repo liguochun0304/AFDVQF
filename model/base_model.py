@@ -79,6 +79,8 @@ class AFDVQF(nn.Module):
         self.use_qfnet = bool(getattr(config, "use_qfnet", True))
         self.use_type_queries = bool(getattr(config, "use_type_queries", True))
         self.use_mqs = bool(getattr(config, "use_mqs", True))
+        self.use_dual_vision_extractor = bool(getattr(config, "use_dual_vision_extractor", True))
+        self.use_simple_fusion = bool(getattr(config, "use_simple_fusion", False))
         pooling = str(getattr(config, "alignment_pooling", "cls")).lower()
         self.alignment_pooling = pooling if pooling in {"cls", "mean"} else "cls"
         self.alignment_symmetric = bool(getattr(config, "alignment_symmetric", True))
@@ -104,12 +106,19 @@ class AFDVQF(nn.Module):
             self.clip = CLIPModel.from_pretrained(v_path, local_files_only=True)
             for p in self.clip.parameters():
                 p.requires_grad = False
-            self.vision_extractor = DualVisionTokenExtractor(
-                clip=self.clip,
-                hidden_dim=self.hidden_dim,
-                config=config,
-                script_dir=self.script_dir,
-            )
+            if self.use_dual_vision_extractor:
+                self.vision_extractor = DualVisionTokenExtractor(
+                    clip=self.clip,
+                    hidden_dim=self.hidden_dim,
+                    config=config,
+                    script_dir=self.script_dir,
+                )
+            else:
+                vision_dim = self.clip.vision_model.config.hidden_size
+                self.simple_vision_proj = nn.Sequential(
+                    nn.Linear(vision_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                )
 
         # ----- queries & fusion (×N) -----
         self.tokenizer = tokenizer
@@ -159,11 +168,20 @@ class AFDVQF(nn.Module):
         # vision tokens
         has_image = self.use_image and (image_tensor is not None or raw_images is not None)
         if has_image:
-            vis_feat, vis_mask = self.vision_extractor(
-                image_tensor=image_tensor,
-                raw_images=raw_images,
-                det_results=det_cache,
-            )  # [B,Mv,H], [B,Mv]
+            if self.use_dual_vision_extractor:
+                vis_feat, vis_mask = self.vision_extractor(
+                    image_tensor=image_tensor,
+                    raw_images=raw_images,
+                    det_results=det_cache,
+                )  # [B,Mv,H], [B,Mv]
+            else:
+                if image_tensor is None:
+                    raise ValueError("use_dual_vision_extractor=False 需要 image_tensor（CLIP 预处理输出）")
+                out = self.clip.vision_model(pixel_values=image_tensor)
+                pooled = out.pooler_output if getattr(out, "pooler_output", None) is not None else out.last_hidden_state[:, 0, :]
+                pooled = self.simple_vision_proj(pooled)  # [B,H]
+                vis_feat = pooled.unsqueeze(1)  # [B,1,H]
+                vis_mask = torch.ones((B, 1), device=pooled.device, dtype=torch.long)
         else:
             vis_feat = torch.zeros((B, 1, H), device=text_feat.device, dtype=text_feat.dtype)
             vis_mask = torch.ones((B, 1), device=text_feat.device, dtype=torch.long)
@@ -184,8 +202,10 @@ class AFDVQF(nn.Module):
 
             # fusion (×N)
             _, enhanced_text = self.qfnet(queries, text_feat, attention_mask, vis_feat, vis_mask)  # [B,L,H]
+        elif self.use_simple_fusion and has_image:
+            enhanced_text = text_feat + vision_global.unsqueeze(1)
 
-        if self.use_adaptive_fusion and has_image:
+        if self.use_adaptive_fusion and has_image and not self.use_simple_fusion:
             enhanced_text = self.adaptive_fusion(enhanced_text, vision_global)
 
         # CRF

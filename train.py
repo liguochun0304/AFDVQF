@@ -81,24 +81,29 @@ def load_model_checkpoint(model, optimizer, scheduler, load_dir):
 
 def train(config):
     print("train config:", config)
-    model_name = "afdvqf"
-    base_run_name = "{0}_train-{1}_{2}_{3}".format(
-        datetime.now().strftime('%Y-%m-%d'),
-        config.dataset_name,
-        model_name,
-        config.ex_name,
-    )
     save_root = os.path.join(STORAGE_ROOT, "save_models")
-    run_name = base_run_name
-    save_dir = os.path.join(save_root, run_name)
-    if os.path.exists(save_dir):
-        idx = 1
-        while True:
-            run_name = "{0}_{1:03d}".format(base_run_name, idx)
-            save_dir = os.path.join(save_root, run_name)
-            if not os.path.exists(save_dir):
-                break
-            idx += 1
+    save_name = getattr(config, "save_name", None)
+    if save_name and str(save_name) != "None":
+        run_name = str(save_name)
+        save_dir = os.path.join(save_root, run_name)
+    else:
+        model_name = "afdvqf"
+        base_run_name = "{0}_train-{1}_{2}_{3}".format(
+            datetime.now().strftime('%Y-%m-%d'),
+            config.dataset_name,
+            model_name,
+            config.ex_name,
+        )
+        run_name = base_run_name
+        save_dir = os.path.join(save_root, run_name)
+        if os.path.exists(save_dir):
+            idx = 1
+            while True:
+                run_name = "{0}_{1:03d}".format(base_run_name, idx)
+                save_dir = os.path.join(save_root, run_name)
+                if not os.path.exists(save_dir):
+                    break
+                idx += 1
     tb_dir = os.path.join("/root/tf-logs", run_name)
     os.makedirs(tb_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=tb_dir)
@@ -434,6 +439,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--ex_name", type=str, default=None)
+    parser.add_argument("--save_name", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_len", type=int, default=None)
@@ -446,6 +452,8 @@ if __name__ == "__main__":
     parser.add_argument("--alignment_pooling", type=str, default=None)
     parser.add_argument("--alignment_symmetric", type=_parse_bool, default=None)
     parser.add_argument("--use_adaptive_fusion", type=_parse_bool, default=None)
+    parser.add_argument("--use_dual_vision_extractor", type=_parse_bool, default=None)
+    parser.add_argument("--use_simple_fusion", type=_parse_bool, default=None)
     parser.add_argument("--use_qfnet", type=_parse_bool, default=None)
     parser.add_argument("--use_type_queries", type=_parse_bool, default=None)
     parser.add_argument("--use_mqs", type=_parse_bool, default=None)

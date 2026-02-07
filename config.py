@@ -56,6 +56,8 @@ class Config:
     use_qfnet: bool = True
     use_type_queries: bool = True
     use_mqs: bool = True
+    use_dual_vision_extractor: bool = True
+    use_simple_fusion: bool = False
 
     # -----------------------------
     # Alignment & fusion
@@ -81,6 +83,7 @@ class Config:
     # -----------------------------
     ex_name: str = "afdvqf_best"
     continue_train_name: str = "None"
+    save_name: str = "None"
 
 
 def get_config() -> Config:
