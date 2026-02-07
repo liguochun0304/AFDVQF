@@ -1,4 +1,4 @@
-python3 train.py \
+python3 ../train.py \
   --dataset_name twitter2015 \
   --device cuda:0 \
   --ex_name ablation_clip_only \
@@ -8,13 +8,13 @@ python3 train.py \
   --use_patch_tokens true \
   --use_region_tokens false
 
-python3 test.py \
+python3 ../test.py \
   --save_name ablation_clip_only_twitter2015 \
   --device cuda:0 \
   --split test \
   --record_file logs/ablation_records.csv
 
-python3 train.py \
+python3 ../train.py \
   --dataset_name twitter2017 \
   --device cuda:0 \
   --ex_name ablation_clip_only \
@@ -24,7 +24,7 @@ python3 train.py \
   --use_patch_tokens true \
   --use_region_tokens false
 
-python3 test.py \
+python3 ../test.py \
   --save_name ablation_clip_only_twitter2017 \
   --device cuda:0 \
   --split test \

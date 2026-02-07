@@ -1,12 +1,35 @@
 # AFDVQF
-**AFDVQF: Alignment‑Fusion Dual‑branch Vision Query Fusion for Multimodal Named Entity Recognition**
-中文名：对齐融合的双分支视觉查询融合多模态命名实体识别（AFDVQF）
 
-AFDVQF is a practical research implementation for **multimodal named entity recognition (MNER)** that fuses text and images. The core model, `AFDVQF`, combines a BERT/Roberta text encoder, a CLIP visual encoder, dual-branch vision tokens, query-guided fusion, alignment-enhanced training, and CRF decoding over BIO tags. It is designed to run **offline with local weights**.
+<div align="center">
+  <h1 align="center">
+    <img src="image/afdvqf_logo.png" width="220" alt="AFDVQF Logo" />
+    <br>
+    AFDVQF
+  </h1>
+  <p><b>Alignment-Fusion Dual-branch Vision Query Fusion for Multimodal Named Entity Recognition</b></p>
+  <p>
+    <a href="#">Project</a> |
+    <a href="#">Paper</a> |
+    <a href="#">Dataset</a> |
+    <a href="#">Poster</a>
+  </p>
+</div>
 
 **Language:** English | [中文](README.zh-CN.md)
 
-## Highlights
+## 📰 News
+
+- YYYY-MM-DD: TODO - add your latest update here.
+
+## 👋 Overview
+
+AFDVQF is a practical research implementation for **multimodal named entity recognition (MNER)** that fuses text and images. The core model combines a BERT/Roberta text encoder, a CLIP visual encoder, dual-branch vision tokens (patch + region), query-guided fusion, alignment-enhanced training, and CRF decoding over BIO tags. The codebase is designed to run **offline with local weights**.
+
+<div align="center">
+  <img src="image/afdvqf_overview.png" width="860" alt="AFDVQF Overview" />
+</div>
+
+### Highlights
 
 - Text encoder: BERT / Roberta (local-only loading)
 - Visual encoder: CLIP (local-only loading)
@@ -18,29 +41,56 @@ AFDVQF is a practical research implementation for **multimodal named entity reco
 - Optional alignment loss (contrastive InfoNCE)
 - Offline-friendly path resolution for local weights
 
-## Quick Start
+## 🧩 Model Architecture
 
-1. Install dependencies.
+<div align="center">
+  <img src="image/afdvqf_framework.png" width="900" alt="AFDVQF framework" />
+  <p><em>Figure 1: AFDVQF framework overview.</em></p>
+</div>
+
+## 📊 Results
+
+### Comparison Results
+
+| Model | Twitter2015 F1 | Twitter2017 F1 | NewsMKG F1 |
+| --- | --- | --- | --- |
+| AFDVQF (Ours) | TBD | TBD | TBD |
+| Baseline-A | TBD | TBD | TBD |
+| Baseline-B | TBD | TBD | TBD |
+
+### Ablation Results
+
+| Setting | Twitter2015 F1 | Twitter2017 F1 | NewsMKG F1 |
+| --- | --- | --- | --- |
+| Full | TBD | TBD | TBD |
+| w/o Alignment | TBD | TBD | TBD |
+| w/o Region Tokens | TBD | TBD | TBD |
+| w/o Patch Tokens | TBD | TBD | TBD |
+| Text Only | TBD | TBD | TBD |
+
+## 🔍 Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-2. Prepare local weights for `text_encoder` and `image_encoder`.
+## 🚀 Quick Start
 
-3. Train.
+1. Prepare local weights for `text_encoder` and `image_encoder`.
+
+2. Train.
 
 ```bash
 bash script/train.sh
 ```
 
-4. Evaluate.
+3. Evaluate.
 
 ```bash
 bash script/test.sh <save_name> [split] [device]
 ```
 
-## Project Layout
+## 🗂️ Project Layout
 
 - `train.py` - training entry
 - `test.py` - evaluation entry (loads saved checkpoints)
@@ -56,7 +106,7 @@ bash script/test.sh <save_name> [split] [device]
 - `requirements.txt` - pinned dependencies
 - `data/no_images.jpg` - fallback image for missing samples
 
-## Data and Paths
+## 🗄️ Data and Paths
 
 Default root is `/root/autodl-fs`.
 
@@ -82,7 +132,7 @@ If your paths differ:
 - Update `STORAGE_ROOT` / `DATA_ROOT` in `train.py`.
 - Or override `STORAGE_ROOT` / `SAVE_ROOT` for evaluation only.
 
-## Local Weights
+## 💾 Local Weights
 
 `text_encoder` and `image_encoder` are resolved by `_resolve_path`:
 - Absolute paths work directly.
@@ -90,7 +140,7 @@ If your paths differ:
 
 Both encoders are loaded with `local_files_only=True`, so ensure the weights exist locally.
 
-## Configuration
+## ⚙️ Configuration
 
 Key knobs in `config.py`:
 - `text_encoder`, `image_encoder`, `use_image`
@@ -99,9 +149,7 @@ Key knobs in `config.py`:
 - `use_adaptive_fusion`
 - `detector_topk`, `detector_score_thr`, `detector_nms_iou`, `detector_ckpt`
 
-## Training
-
-Quick start with the provided script:
+## 🏋️ Training
 
 ```bash
 bash script/train.sh
@@ -113,9 +161,7 @@ Or run directly:
 python train.py
 ```
 
-To change dataset / encoders / hyper-params, edit `config.py`.
-
-## Evaluation
+## 🧪 Evaluation
 
 `test.py` loads `config.json` and `model.pt` from a saved run directory:
 
@@ -130,7 +176,7 @@ SAVE_ROOT=/your/save_models \
 python test.py --save_name <run_name>
 ```
 
-## Ablation
+## 🔬 Ablation
 
 We provide a unified ablation runner in `script/ablation.sh`.
 
@@ -161,16 +207,23 @@ Available ablations:
 - `text_only`: disable all image inputs
 - `qfnet1`: set `qfnet_layers=1`
 
-## Notes
+## ✍️ Citation
 
-- Missing images fall back to `data/no_images.jpg`.
-- Faster R-CNN will download weights via torchvision by default. For strict offline use, set `detector_ckpt` in `config.py`.
-- For text-only runs, set `use_image=False` in `config.py`.
+If you find this repo useful, please cite:
 
-## License
+```bibtex
+@article{afdvqf,
+  title   = {AFDVQF: Alignment-Fusion Dual-branch Vision Query Fusion for Multimodal Named Entity Recognition},
+  author  = {TODO},
+  journal = {TODO},
+  year    = {TODO}
+}
+```
+
+## 📄 License
 
 See `LICENSE`.
 
-## Acknowledgements
+## 🙏 Acknowledgements
 
 This repo builds on the open-source ecosystems of PyTorch, Transformers, and CLIP.
