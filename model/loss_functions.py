@@ -12,6 +12,7 @@ def contrastive_loss(
     text_features: torch.Tensor,
     image_features: torch.Tensor,
     temperature: float = 0.07,
+    symmetric: bool = True,
 ) -> torch.Tensor:
     """
     InfoNCE over batch, symmetric (t2i + i2t) / 2.
@@ -24,5 +25,7 @@ def contrastive_loss(
     logits = torch.matmul(t, i.transpose(0, 1)) / temperature
     labels = torch.arange(logits.size(0), device=logits.device)
     loss_t2i = F.cross_entropy(logits, labels)
+    if not symmetric:
+        return loss_t2i
     loss_i2t = F.cross_entropy(logits.transpose(0, 1), labels)
     return 0.5 * (loss_t2i + loss_i2t)

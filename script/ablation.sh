@@ -1,127 +1,141 @@
 #!/bin/bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
-STAMP="$(date +%F_%H%M%S)"
+DATASET="${DATASET:-twitter2015}"
+DEVICE="${DEVICE:-cuda:0}"
+EPOCHS="${EPOCHS:-50}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
+MAX_LEN="${MAX_LEN:-128}"
+EX_PREFIX="${EX_PREFIX:-ablation}"
+
+# Comma-separated groups to run. Example:
+# RUN_GROUPS="core,vision,query,align" bash script/ablation.sh
+RUN_GROUPS="${RUN_GROUPS:-core}"
+
 LOG_DIR="$ROOT_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-DATASET="twitter2015"
-DEVICE="cuda:0"
-EPOCHS=""
-BATCH_SIZE=""
-DRY_RUN=0
-EXPS=()
-
 usage() {
-  cat <<'USAGE'
-Usage: bash script/ablation.sh [options]
-
-Options:
-  --exp <name>        Run a specific ablation (repeatable). Use "all" for all.
-  --dataset <name>    Dataset name (twitter2015|twitter2017|NewsMKG)
-  --device <dev>      Device string (e.g., cuda:0)
-  --epochs <n>        Override epochs
-  --batch_size <n>    Override batch size
-  --dry-run           Print commands only
-  --list              List available ablations
-  -h, --help          Show this help
-
-Available ablations:
-  full        : full model (baseline)
-  no_align    : disable alignment loss
-  no_adapt    : disable adaptive fusion
-  no_region   : disable region tokens (CLIP patch only)
-  no_patch    : disable patch tokens (detector regions only)
-  text_only   : disable all image inputs
-  qfnet1      : set qfnet_layers=1
-USAGE
+  echo "Usage: RUN_GROUPS=core,vision,query,align bash script/ablation.sh"
+  echo "Env vars: DATASET DEVICE EPOCHS BATCH_SIZE MAX_LEN EX_PREFIX PYTHON_BIN"
+  echo "Groups: core | vision | query | align"
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --exp) EXPS+=("$2"); shift 2;;
-    --dataset) DATASET="$2"; shift 2;;
-    --device) DEVICE="$2"; shift 2;;
-    --epochs) EPOCHS="$2"; shift 2;;
-    --batch_size) BATCH_SIZE="$2"; shift 2;;
-    --dry-run) DRY_RUN=1; shift;;
-    --list)
-      usage
-      exit 0
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1"
-      usage
-      exit 1
-      ;;
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+has_group() {
+  case ",${RUN_GROUPS}," in
+    *",${1},"*) return 0 ;;
+    *) return 1 ;;
   esac
- done
+}
 
-if [[ ${#EXPS[@]} -eq 0 ]]; then
-  EXPS=("all")
-fi
+slug() {
+  echo "$1" | sed 's/\./p/g'
+}
 
-if [[ "${EXPS[0]}" == "all" ]]; then
-  EXPS=(full no_align no_adapt no_region no_patch text_only qfnet1)
-fi
-
-run_exp() {
+run() {
   local name="$1"; shift
-  local ex_name="abl_${DATASET}_${name}"
-  local log_file="$LOG_DIR/ablation_${name}_${STAMP}.log"
-  local cmd=(python train.py --dataset_name "$DATASET" --device "$DEVICE" --ex_name "$ex_name")
+  local stamp
+  stamp="$(date +%F_%H%M%S)"
+  local ex_name="${EX_PREFIX}_${name}"
+  local log_file="$LOG_DIR/${ex_name}_${stamp}.log"
 
-  if [[ -n "$EPOCHS" ]]; then
-    cmd+=(--epochs "$EPOCHS")
-  fi
-  if [[ -n "$BATCH_SIZE" ]]; then
-    cmd+=(--batch_size "$BATCH_SIZE")
-  fi
-
-  cmd+=("$@")
+  local cmd=(
+    "$PYTHON_BIN" "$ROOT_DIR/train.py"
+    --dataset_name "$DATASET"
+    --device "$DEVICE"
+    --epochs "$EPOCHS"
+    --batch_size "$BATCH_SIZE"
+    --max_len "$MAX_LEN"
+    --ex_name "$ex_name"
+    "$@"
+  )
 
   echo "Running: ${cmd[*]}"
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "(dry-run)"
-  else
-    "${cmd[@]}" 2>&1 | tee -a "$log_file"
-  fi
+  "${cmd[@]}" 2>&1 | tee -a "$log_file"
 }
 
-for exp in "${EXPS[@]}"; do
-  case "$exp" in
-    full)
-      run_exp "full"
-      ;;
-    no_align)
-      run_exp "no_align" --use_alignment_loss false
-      ;;
-    no_adapt)
-      run_exp "no_adapt" --use_adaptive_fusion false
-      ;;
-    no_region)
-      run_exp "no_region" --use_region_tokens false
-      ;;
-    no_patch)
-      run_exp "no_patch" --use_patch_tokens false
-      ;;
-    text_only)
-      run_exp "text_only" --use_image false
-      ;;
-    qfnet1)
-      run_exp "qfnet1" --qfnet_layers 1
-      ;;
-    *)
-      echo "Unknown ablation: $exp"
-      usage
-      exit 1
-      ;;
-  esac
- done
+if has_group core; then
+  run "full" \
+    --use_image true \
+    --use_patch_tokens true \
+    --use_region_tokens true \
+    --use_qfnet true \
+    --use_type_queries true \
+    --use_mqs true \
+    --use_alignment_loss true \
+    --alignment_loss_weight 0.1 \
+    --alignment_pooling cls \
+    --alignment_symmetric true \
+    --use_adaptive_fusion true
+
+  run "text_only" \
+    --use_image false \
+    --use_qfnet false \
+    --use_adaptive_fusion false \
+    --use_alignment_loss false
+
+  run "no_qfnet" \
+    --use_qfnet false \
+    --use_adaptive_fusion false
+
+  run "no_adaptive_fusion" \
+    --use_adaptive_fusion false
+fi
+
+if has_group vision; then
+  run "patch_only" \
+    --use_patch_tokens true \
+    --use_region_tokens false
+
+  run "region_only" \
+    --use_patch_tokens false \
+    --use_region_tokens true
+
+  run "no_vision" \
+    --use_image false
+fi
+
+if has_group query; then
+  run "no_type_queries" \
+    --use_type_queries false
+
+  run "no_mqs" \
+    --use_mqs false
+
+  run "qfnet_l1" \
+    --qfnet_layers 1
+
+  run "qfnet_l0" \
+    --qfnet_layers 0 \
+    --use_adaptive_fusion false
+fi
+
+if has_group align; then
+  run "no_align" \
+    --use_alignment_loss false
+
+  for w in 0.05 0.1 0.2; do
+    run "align_w$(slug "$w")" \
+      --alignment_loss_weight "$w"
+  done
+
+  for t in 0.03 0.07 0.1; do
+    run "align_t$(slug "$t")" \
+      --alignment_temperature "$t"
+  done
+
+  run "align_mean_pool" \
+    --alignment_pooling mean
+
+  run "align_t2i" \
+    --alignment_symmetric false
+fi

@@ -53,6 +53,9 @@ class Config:
     slots_per_type: int = 15
     qfnet_layers: int = 2
     qfnet_heads: int = 8
+    use_qfnet: bool = True
+    use_type_queries: bool = True
+    use_mqs: bool = True
 
     # -----------------------------
     # Alignment & fusion
@@ -60,6 +63,8 @@ class Config:
     use_alignment_loss: bool = True
     alignment_loss_weight: float = 0.1
     alignment_temperature: float = 0.07
+    alignment_pooling: str = "cls"  # cls | mean
+    alignment_symmetric: bool = True
     use_adaptive_fusion: bool = True
 
     # -----------------------------

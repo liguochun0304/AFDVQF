@@ -140,18 +140,30 @@ def train(config):
     }
     img_path = IMG_PATH[config.dataset_name]
     data_path = DATA_PATH[config.dataset_name]
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225])])
+    use_image = bool(getattr(config, "use_image", True))
+    use_patch_tokens = bool(getattr(config, "use_patch_tokens", True))
+    use_region_tokens = bool(getattr(config, "use_region_tokens", True))
+    if not use_image:
+        use_patch_tokens = False
+        use_region_tokens = False
+
     clip_processor = None
-    use_patch_tokens = getattr(config, "use_patch_tokens", True)
-    use_region_tokens = getattr(config, "use_region_tokens", True)
-    if config.use_image and use_patch_tokens:
+    transform = None
+    if use_image and use_patch_tokens:
         v_path = _resolve_path(script_dir, config.image_encoder)
         clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
+    if use_image and use_patch_tokens and clip_processor is None:
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])])
+
+    return_image_tensor = use_image and use_patch_tokens
+    return_raw_image = use_image and use_region_tokens
+    if not (return_image_tensor or return_raw_image):
+        img_path = None
 
     processor = MMPNERProcessor(data_path, config.text_encoder)
     train_dataset = MMPNERDataset(
@@ -163,6 +175,8 @@ def train(config):
         mode='train',
         set_prediction=True,
         clip_processor=clip_processor,
+        return_image_tensor=return_image_tensor,
+        return_raw_image=return_raw_image,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True,
@@ -182,6 +196,8 @@ def train(config):
         mode='valid',
         set_prediction=True,
         clip_processor=clip_processor,
+        return_image_tensor=return_image_tensor,
+        return_raw_image=return_raw_image,
     )
 
     val_loader = DataLoader(
@@ -426,7 +442,13 @@ if __name__ == "__main__":
     parser.add_argument("--use_region_tokens", type=_parse_bool, default=None)
     parser.add_argument("--use_alignment_loss", type=_parse_bool, default=None)
     parser.add_argument("--alignment_loss_weight", type=float, default=None)
+    parser.add_argument("--alignment_temperature", type=float, default=None)
+    parser.add_argument("--alignment_pooling", type=str, default=None)
+    parser.add_argument("--alignment_symmetric", type=_parse_bool, default=None)
     parser.add_argument("--use_adaptive_fusion", type=_parse_bool, default=None)
+    parser.add_argument("--use_qfnet", type=_parse_bool, default=None)
+    parser.add_argument("--use_type_queries", type=_parse_bool, default=None)
+    parser.add_argument("--use_mqs", type=_parse_bool, default=None)
     parser.add_argument("--qfnet_layers", type=int, default=None)
     parser.add_argument("--qfnet_heads", type=int, default=None)
     parser.add_argument("--detector_topk", type=int, default=None)

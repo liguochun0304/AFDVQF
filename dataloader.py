@@ -188,6 +188,8 @@ class MMPNERDataset(Dataset):
         ignore_idx=0,
         set_prediction=False,
         clip_processor: CLIPProcessor = None,
+        return_image_tensor: bool = True,
+        return_raw_image: bool = True,
     ):
         self.processor = processor
         self.transform = transform
@@ -203,6 +205,8 @@ class MMPNERDataset(Dataset):
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.set_prediction = set_prediction
         self.clip_processor = clip_processor
+        self.return_image_tensor = return_image_tensor
+        self.return_raw_image = return_raw_image
         self.type_names = get_entity_type_names(self.label_mapping)
 
         # 常用 id
@@ -251,7 +255,8 @@ class MMPNERDataset(Dataset):
 
         raw_image = None
         image_tensor = None
-        if self.img_path is not None:
+        need_image = self.return_raw_image or self.return_image_tensor
+        if self.img_path is not None and need_image:
             try:
                 img_path = os.path.join(self.img_path, img)
                 img_pil = Image.open(img_path).convert('RGB')
@@ -261,13 +266,15 @@ class MMPNERDataset(Dataset):
                     img_path = os.path.join(self.script_dir, 'data', 'no_images.jpg')
                 img_pil = Image.open(img_path).convert('RGB')
 
-            raw_image = TF.to_tensor(img_pil)  # float32, [0,1]
+            if self.return_raw_image:
+                raw_image = TF.to_tensor(img_pil)  # float32, [0,1]
 
-            if self.clip_processor is not None:
-                clip_out = self.clip_processor(images=img_pil, return_tensors="pt")
-                image_tensor = clip_out["pixel_values"].squeeze(0)
-            elif self.transform is not None:
-                image_tensor = self.transform(img_pil)
+            if self.return_image_tensor:
+                if self.clip_processor is not None:
+                    clip_out = self.clip_processor(images=img_pil, return_tensors="pt")
+                    image_tensor = clip_out["pixel_values"].squeeze(0)
+                elif self.transform is not None:
+                    image_tensor = self.transform(img_pil)
 
         out = {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 

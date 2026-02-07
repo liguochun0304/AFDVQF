@@ -208,23 +208,35 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
     if split not in ("valid", "test", "train"):
         raise ValueError(f"不支持的 split: {split}")
 
-    transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    use_image = bool(getattr(config, "use_image", True))
+    use_patch_tokens = bool(getattr(config, "use_patch_tokens", True))
+    use_region_tokens = bool(getattr(config, "use_region_tokens", True))
+    if not use_image:
+        use_patch_tokens = False
+        use_region_tokens = False
 
+    transform = None
     clip_processor = None
-    use_patch_tokens = getattr(config, "use_patch_tokens", True)
-    if getattr(config, "use_image", False) and use_patch_tokens:
+    if use_image and use_patch_tokens:
         v_path = _resolve_path(script_dir, getattr(config, "image_encoder", ""))
         if not v_path:
             raise ValueError(f"image_encoder 路径无效或不存在: {getattr(config, 'image_encoder', '')}")
         clip_processor = CLIPProcessor.from_pretrained(v_path, local_files_only=True)
+    if use_image and use_patch_tokens and clip_processor is None:
+        transform = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+    return_image_tensor = use_image and use_patch_tokens
+    return_raw_image = use_image and use_region_tokens
 
     dataset_data_path = data_path[dataset_name]
     dataset_img_path = img_path[dataset_name]
+    if not (return_image_tensor or return_raw_image):
+        dataset_img_path = None
     processor = MMPNERProcessor(dataset_data_path, getattr(config, "text_encoder", ""))
     dataset = MMPNERDataset(
         processor,
@@ -235,6 +247,8 @@ def run_test(save_name: str, save_root: str, device_str: str, batch_size: Option
         mode=split,
         set_prediction=True,
         clip_processor=clip_processor,
+        return_image_tensor=return_image_tensor,
+        return_raw_image=return_raw_image,
     )
     dataloader = DataLoader(
         dataset,

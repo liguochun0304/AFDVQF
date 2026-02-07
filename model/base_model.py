@@ -76,6 +76,12 @@ class AFDVQF(nn.Module):
         self.use_alignment_loss = bool(getattr(config, "use_alignment_loss", True))
         self.alignment_loss_weight = float(getattr(config, "alignment_loss_weight", 0.1))
         self.alignment_temperature = float(getattr(config, "alignment_temperature", 0.07))
+        self.use_qfnet = bool(getattr(config, "use_qfnet", True))
+        self.use_type_queries = bool(getattr(config, "use_type_queries", True))
+        self.use_mqs = bool(getattr(config, "use_mqs", True))
+        pooling = str(getattr(config, "alignment_pooling", "cls")).lower()
+        self.alignment_pooling = pooling if pooling in {"cls", "mean"} else "cls"
+        self.alignment_symmetric = bool(getattr(config, "alignment_symmetric", True))
         self.use_adaptive_fusion = bool(getattr(config, "use_adaptive_fusion", True))
 
         # ----- text encoder -----
@@ -164,13 +170,21 @@ class AFDVQF(nn.Module):
 
         vision_global = _masked_mean(vis_feat, vis_mask)
 
-        # build queries
-        type_q = self.type_query_gen()                 # [T,H]
-        q, _ = self.mqs(type_q)                        # [Q,H]
-        queries = q.unsqueeze(0).expand(B, -1, -1)     # [B,Q,H]
+        enhanced_text = text_feat
+        if self.use_qfnet:
+            # build queries
+            type_q = self.type_query_gen()                 # [T,H]
+            if not self.use_type_queries:
+                type_q = torch.zeros_like(type_q)
+            if self.use_mqs:
+                q, _ = self.mqs(type_q)                    # [Q,H]
+            else:
+                q = type_q
+            queries = q.unsqueeze(0).expand(B, -1, -1)     # [B,Q,H]
 
-        # fusion (×N)
-        _, enhanced_text = self.qfnet(queries, text_feat, attention_mask, vis_feat, vis_mask)  # [B,L,H]
+            # fusion (×N)
+            _, enhanced_text = self.qfnet(queries, text_feat, attention_mask, vis_feat, vis_mask)  # [B,L,H]
+
         if self.use_adaptive_fusion and has_image:
             enhanced_text = self.adaptive_fusion(enhanced_text, vision_global)
 
@@ -183,11 +197,15 @@ class AFDVQF(nn.Module):
             total_loss = ner_loss
             align_loss = text_feat.new_tensor(0.0)
             if self.use_alignment_loss and has_image:
-                text_global = text_feat[:, 0, :]
+                if self.alignment_pooling == "mean":
+                    text_global = _masked_mean(text_feat, attention_mask)
+                else:
+                    text_global = text_feat[:, 0, :]
                 align_loss = contrastive_loss(
                     text_global,
                     vision_global,
                     temperature=self.alignment_temperature,
+                    symmetric=self.alignment_symmetric,
                 )
                 total_loss = total_loss + self.alignment_loss_weight * align_loss
             if return_loss_dict:
