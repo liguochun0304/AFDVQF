@@ -2,7 +2,7 @@
 
 <div align="center">
   <h1 align="center">
-    <img src="image/afdvqf_logo.png" width="220" alt="AFDVQF Logo" />
+    <img src="image/logo.png" width="220" alt="AFDVQF Logo" />
     <br>
     AFDVQF
   </h1>

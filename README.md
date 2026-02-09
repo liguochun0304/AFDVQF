@@ -2,7 +2,7 @@
 
 <div align="center">
   <h1 align="center">
-    <img src="image/afdvqf_logo.png" width="220" alt="AFDVQF Logo" />
+    <img src="image/logo.png" width="220" alt="AFDVQF Logo" />
     <br>
     AFDVQF
   </h1>
@@ -19,7 +19,7 @@
 
 ## 📰 News
 
-- YYYY-MM-DD: TODO - add your latest update here.
+- 2025-07-22 13:13: Project started by liguochun.
 
 ## 👋 Overview
 
