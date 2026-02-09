@@ -4,7 +4,6 @@
   <h1 align="center">
     <img src="image/logo.png" width="220" alt="AFDVQF Logo" />
     <br>
-    AFDVQF
   </h1>
   <p><b>对齐融合的双分支视觉查询融合多模态命名实体识别</b></p>
   <p>英文名：Alignment-Fusion Dual-branch Vision Query Fusion for Multimodal Named Entity Recognition</p>

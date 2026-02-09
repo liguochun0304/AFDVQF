@@ -4,7 +4,6 @@
   <h1 align="center">
     <img src="image/logo.png" width="220" alt="AFDVQF Logo" />
     <br>
-    AFDVQF
   </h1>
   <p><b>Alignment-Fusion Dual-branch Vision Query Fusion for Multimodal Named Entity Recognition</b></p>
   <p>
